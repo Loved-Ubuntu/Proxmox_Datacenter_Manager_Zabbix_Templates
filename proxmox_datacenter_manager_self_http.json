@@ -1,0 +1,1999 @@
+{
+  "zabbix_export": {
+    "version": "7.0",
+    "template_groups": [
+      {
+        "uuid": "90dd5c27b7a140cb9364e459d5e1be53",
+        "name": "Templates/Applications"
+      }
+    ],
+    "templates": [
+      {
+        "uuid": "fbb59e5c3d6748afba02cbd90ed3047e",
+        "template": "Proxmox Datacenter Manager self by HTTP",
+        "name": "Proxmox Datacenter Manager self by HTTP",
+        "description": "Monitors ONLY the PDM appliance itself via authenticated HTTPS GET requests to /nodes/localhost/status, /nodes/localhost/rrddata and /nodes/localhost/certificates/info (expiry of PDM's own certificate). No remotes, PVE/PBS hosts, guests or managed storage are queried or discovered. Zabbix 7.0+; local RRD requires PDM 1.1+. Set {$PDM.URL}, {$PDM.TOKEN.ID} and {$PDM.TOKEN.SECRET}; grant Auditor to both user and token on /system/status. TLS certificate verification (peer and host) is disabled by default so the self-signed certificate PDM ships with works out of the box. To enforce verification, set \"SSL verify peer\" and \"SSL verify host\" on both HTTP agent items after installing the PDM CA on the Zabbix server/proxy (or replacing the PDM certificate) and using a URL that matches it. Failures are classified: HIGH when the request fails (see items \"Status HTTP code\" and \"Status request result\"), WARNING when the API answers but the payload is incomplete. Not covered: pending updates. See accompanying Dutch setup guide.",
+        "groups": [
+          {
+            "name": "Templates/Applications"
+          }
+        ],
+        "items": [
+          {
+            "uuid": "0e7cfa4f4ec74b8587441dd9018a6950",
+            "name": "PDM: Get local node status",
+            "type": "HTTP_AGENT",
+            "key": "pdm.status.get",
+            "delay": "{$PDM.INTERVAL}",
+            "history": "0",
+            "trends": "0",
+            "value_type": "TEXT",
+            "url": "{$PDM.URL}/api2/json/nodes/localhost/status",
+            "request_method": "GET",
+            "retrieve_mode": "BOTH",
+            "output_format": "RAW",
+            "status_codes": "",
+            "follow_redirects": "NO",
+            "timeout": "15s",
+            "verify_peer": "NO",
+            "verify_host": "NO",
+            "headers": [
+              {
+                "name": "Authorization",
+                "value": "PDMAPIToken={$PDM.TOKEN.ID}:{$PDM.TOKEN.SECRET}"
+              },
+              {
+                "name": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "preprocessing": [
+              {
+                "type": "CHECK_NOT_SUPPORTED",
+                "parameters": [
+                  "-1"
+                ],
+                "error_handler": "CUSTOM_VALUE",
+                "error_handler_params": "TRANSPORT-ERROR"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "raw"
+              }
+            ],
+            "description": "GET only; localhost refers to the PDM host itself. Headers and body are both retrieved and any HTTP status is accepted, so the dependent \"Local node status payload\" item can tell 401/403/404/5xx apart from transport failures (DNS, TLS, timeout), which are replaced by the marker TRANSPORT-ERROR. No managed resources are queried."
+          },
+          {
+            "uuid": "386619b8910b4e4c842d6629c1ba3222",
+            "name": "PDM: Local node status payload",
+            "type": "DEPENDENT",
+            "key": "pdm.status.body",
+            "delay": "0",
+            "history": "0",
+            "trends": "0",
+            "value_type": "TEXT",
+            "master_item": {
+              "key": "pdm.status.get"
+            },
+            "preprocessing": [
+              {
+                "type": "JAVASCRIPT",
+                "parameters": [
+                  "\n// Split \"headers + body\" (retrieve mode BOTH) into status code and body.\n// A value that does not start with HTTP/ is the transport-error marker (no HTTP response).\n// Loops so proxy CONNECT header blocks or 1xx blocks are skipped.\nfunction split(v) {\n  var code = 0, body = String(v);\n  while (body.indexOf('HTTP/') === 0) {\n    var m = /^HTTP\\/[0-9.]+\\s+([0-9]{3})/.exec(body);\n    code = m ? parseInt(m[1], 10) : 0;\n    var i = body.search(/\\r?\\n\\r?\\n/);\n    if (i < 0) { body = ''; break; }\n    body = body.substring(i).replace(/^\\r?\\n\\r?\\n/, '');\n  }\n  return {code: code, body: body};\n}\nfunction hint(code, extra) {\n  if (code === 0) return 'No HTTP response (DNS, TLS, timeout or connection refused)';\n  if (code === 401) return 'HTTP 401: authentication failed, check token ID and secret';\n  if (code === 403) return 'HTTP 403: access denied, check Auditor ACL on /system/status for both user and token';\n  if (code === 404) return 'HTTP 404: endpoint not found, check URL and PDM version' + (extra || '');\n  return 'HTTP ' + code + ': unexpected response';\n}\n\n// Output: the original PDM JSON ({\"data\":{...}}) plus \"http\": <status code>,\n// or {\"http\":<code>,\"error\":\"<reason>\"} when the request failed.\ntry {\n  var r = split(value);\n  if (r.code !== 200) return JSON.stringify({http: r.code, error: hint(r.code)});\n  var b;\n  try { b = JSON.parse(r.body); } catch (e) { b = null; }\n  if (!b || typeof b !== 'object' || Array.isArray(b)) {\n    return JSON.stringify({http: 200, error: 'HTTP 200 but response is not a JSON object, check URL'});\n  }\n  b.http = 200;\n  return JSON.stringify(b);\n} catch (e) {\n  return JSON.stringify({http: 0, error: 'Preprocessing failure: ' + e});\n}\n"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "raw"
+              }
+            ],
+            "description": "Parsed status response: the PDM JSON plus \"http\" (status code), or {\"http\":<code>,\"error\":\"<reason>\"} on failure. All status metrics hang off this item."
+          },
+          {
+            "uuid": "c091ae871af74562a6dc4a5a8d5f264f",
+            "name": "PDM: Status HTTP code",
+            "type": "DEPENDENT",
+            "key": "pdm.http.code",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.http"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "availability"
+              }
+            ],
+            "description": "HTTP status of the status request. 200 = OK, 401 = bad token, 403 = missing Auditor ACL, 404 = wrong URL/version, 0 = no HTTP response (DNS, TLS verification, timeout, refused).",
+            "triggers": [
+              {
+                "uuid": "aa9b618582b04dcaaee457faf0f1d173",
+                "name": "PDM: Status request failed (HTTP {ITEM.LASTVALUE1}, 0 = no response)",
+                "expression": "last(/Proxmox Datacenter Manager self by HTTP/pdm.http.code)<>200 and count(/Proxmox Datacenter Manager self by HTTP/pdm.http.code,{$PDM.FAIL.WINDOW},\"eq\",200)=0",
+                "priority": "HIGH",
+                "description": "The PDM status request has not returned HTTP 200 for the whole window. See item \"PDM: Status request result\" for the reason: 0 = DNS/TLS/timeout/refused (if TLS verification was enabled, also check the certificate chain on the Zabbix server or proxy), 401 = token ID/secret, 403 = Auditor ACL on /system/status for both user and token, 404 = URL/PDM version.",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "availability"
+                  }
+                ]
+              },
+              {
+                "uuid": "a9e1aa9670394def9a84b5361bddf50a",
+                "name": "PDM: No status samples",
+                "expression": "nodata(/Proxmox Datacenter Manager self by HTTP/pdm.http.code,{$PDM.NODATA})=1",
+                "priority": "HIGH",
+                "description": "Zabbix received no result at all from the status item (item disabled, proxy down, or {$PDM.NODATA} shorter than {$PDM.INTERVAL}).",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "availability"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "85f4ea59814c4961a7cbbce2fb9ea092",
+            "name": "PDM: Status request result",
+            "type": "DEPENDENT",
+            "key": "pdm.status.result",
+            "delay": "0",
+            "history": "7d",
+            "trends": "0",
+            "value_type": "TEXT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.error"
+                ],
+                "error_handler": "CUSTOM_VALUE",
+                "error_handler_params": "OK"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "availability"
+              }
+            ],
+            "description": "OK, or the reason the status request failed. Only changes (plus a daily heartbeat) are stored."
+          },
+          {
+            "uuid": "985645ae163b4f9d975914bfd5b4be6c",
+            "name": "PDM: Local status API usable",
+            "type": "DEPENDENT",
+            "key": "pdm.api.available",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JAVASCRIPT",
+                "parameters": [
+                  "\n// 1 = HTTP 200 and the core fields used by the triggers are valid. Used to gate all other triggers.\nvar d;\ntry { var o = JSON.parse(value); if (o.http !== 200) return 0; d = o.data; } catch (e) { return 0; }\nfunction n(x) { return typeof x === 'number' && isFinite(x) && x >= 0; }\nif (!d || !n(d.cpu) || !n(d.uptime)) return 0;\nif (!d.memory || !n(d.memory.total) || !n(d.memory.used) || d.memory.total === 0) return 0;\nif (!d.root || !n(d.root.total) || !n(d.root.used) || d.root.total === 0) return 0;\nreturn 1;\n"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "availability"
+              }
+            ],
+            "description": "1 = HTTP 200 and the core fields (cpu, uptime, memory, root fs) are valid. All metric triggers are gated on this item."
+          },
+          {
+            "uuid": "b002588193af477baaba3dfc6b615658",
+            "name": "PDM: Status schema complete",
+            "type": "DEPENDENT",
+            "key": "pdm.schema.complete",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JAVASCRIPT",
+                "parameters": [
+                  "\n// 1 = every field this template reads is present and sane. Stricter than pdm.api.available.\nvar d;\ntry { var o = JSON.parse(value); if (o.http !== 200) return 0; d = o.data; } catch (e) { return 0; }\nfunction n(x) { return typeof x === 'number' && isFinite(x) && x >= 0; }\nif (!d || !n(d.cpu) || !n(d.wait) || !n(d.uptime)) return 0;\nif (!d.cpuinfo || !n(d.cpuinfo.cpus) || d.cpuinfo.cpus === 0 || typeof d.cpuinfo.model !== 'string') return 0;\nif (!d.loadavg || d.loadavg.length < 3) return 0;\nfor (var i = 0; i < 3; i++) if (!n(d.loadavg[i])) return 0;\nif (!d['current-kernel'] || typeof d['current-kernel'].release !== 'string') return 0;\nvar groups = ['memory', 'swap', 'root'];\nfor (var j = 0; j < groups.length; j++) {\n  var g = d[groups[j]];\n  if (!g || !n(g.total) || !n(g.used) || !n(g[groups[j] === 'root' ? 'avail' : 'free'])) return 0;\n}\nif (d.memory.total === 0 || d.root.total === 0) return 0;\nreturn 1;\n"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "availability"
+              }
+            ],
+            "description": "1 = every field this template reads is present: cpu, wait, uptime, cpuinfo.cpus/model, loadavg[3], current-kernel.release, memory.free, swap.free, root.avail. Stricter than \"Local status API usable\"; 0 usually means a PDM update changed the status schema.",
+            "triggers": [
+              {
+                "uuid": "ebec1a43fd6a4eb4b59e69a0cb87699d",
+                "name": "PDM: Status payload incomplete or unexpected",
+                "expression": "last(/Proxmox Datacenter Manager self by HTTP/pdm.http.code)=200 and max(/Proxmox Datacenter Manager self by HTTP/pdm.schema.complete,{$PDM.FAIL.WINDOW})=0",
+                "priority": "WARNING",
+                "description": "The API answers but one or more fields this template reads are missing or invalid, so some items are being discarded. Compare the payload (Test on \"PDM: Get local node status\") with the item list; the template may need updating for this PDM version.",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "availability"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "a4fa9e05be01437eb002d7a08bb3e9f6",
+            "name": "PDM: CPU utilization",
+            "type": "DEPENDENT",
+            "key": "pdm.cpu.util",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.cpu"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "MULTIPLIER",
+                "parameters": [
+                  "100"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "cpu"
+              }
+            ],
+            "units": "%",
+            "triggers": [
+              {
+                "uuid": "3492d3a65d7c415da9e810af39598182",
+                "name": "PDM: CPU utilization high",
+                "expression": "min(/Proxmox Datacenter Manager self by HTTP/pdm.cpu.util,5m)>{$PDM.CPU.WARN} and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "WARNING",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "performance"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "67d77c431c8c4e89a70bae32b46f21df",
+            "name": "PDM: CPU IO wait",
+            "type": "DEPENDENT",
+            "key": "pdm.cpu.iowait",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.wait"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "MULTIPLIER",
+                "parameters": [
+                  "100"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "cpu"
+              }
+            ],
+            "units": "%",
+            "triggers": [
+              {
+                "uuid": "35c957a7f20745b195adde52d99c2076",
+                "name": "PDM: CPU IO wait high",
+                "expression": "avg(/Proxmox Datacenter Manager self by HTTP/pdm.cpu.iowait,10m)>{$PDM.IOWAIT.WARN} and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "WARNING",
+                "description": "Average CPU IO wait over 10 minutes above {$PDM.IOWAIT.WARN}%. Usually slow or saturated storage under the PDM appliance.",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "performance"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "356891291a094e3eaef838274da3f687",
+            "name": "PDM: Logical CPUs",
+            "type": "DEPENDENT",
+            "key": "pdm.cpu.count",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.cpuinfo.cpus"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "cpu"
+              }
+            ]
+          },
+          {
+            "uuid": "4d1e13bdd9504982b474891d1cca2c2a",
+            "name": "PDM: CPU model",
+            "type": "DEPENDENT",
+            "key": "pdm.cpu.model",
+            "delay": "0",
+            "history": "7d",
+            "trends": "0",
+            "value_type": "TEXT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.cpuinfo.model"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "cpu"
+              }
+            ]
+          },
+          {
+            "uuid": "a7859fbfc5444b89882d9ae21f2fa312",
+            "name": "PDM: Load average 1m",
+            "type": "DEPENDENT",
+            "key": "pdm.load.1",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.loadavg[0]"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "cpu"
+              }
+            ]
+          },
+          {
+            "uuid": "cc2f19cff260407ab1435bd076c9a232",
+            "name": "PDM: Load average 5m",
+            "type": "DEPENDENT",
+            "key": "pdm.load.5",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.loadavg[1]"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "cpu"
+              }
+            ],
+            "triggers": [
+              {
+                "uuid": "91cd8e08ff9548c08a2ec9070722268f",
+                "name": "PDM: Load average per CPU high",
+                "expression": "avg(/Proxmox Datacenter Manager self by HTTP/pdm.load.5,10m)/last(/Proxmox Datacenter Manager self by HTTP/pdm.cpu.count)>{$PDM.LOAD.WARN} and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "WARNING",
+                "description": "5-minute load average, averaged over 10 minutes and divided by the number of logical CPUs, above {$PDM.LOAD.WARN}.",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "performance"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "3bb7bb4682a34346bb16a127ffa44983",
+            "name": "PDM: Load average 15m",
+            "type": "DEPENDENT",
+            "key": "pdm.load.15",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.loadavg[2]"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "cpu"
+              }
+            ]
+          },
+          {
+            "uuid": "c54cbb52c86b43528ec3f2e8d3d3285c",
+            "name": "PDM: Uptime",
+            "type": "DEPENDENT",
+            "key": "pdm.uptime",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.uptime"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "system"
+              }
+            ],
+            "units": "uptime",
+            "triggers": [
+              {
+                "uuid": "11f454221e554204adb9d972ea75c791",
+                "name": "PDM: Recently restarted",
+                "expression": "last(/Proxmox Datacenter Manager self by HTTP/pdm.uptime)<{$PDM.UPTIME.MIN} and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "INFO",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "notice"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "24ea9d9ce20945de85ea8fb8e31b1836",
+            "name": "PDM: Kernel release",
+            "type": "DEPENDENT",
+            "key": "pdm.kernel",
+            "delay": "0",
+            "history": "7d",
+            "trends": "0",
+            "value_type": "TEXT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data['current-kernel'].release"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "system"
+              }
+            ],
+            "triggers": [
+              {
+                "uuid": "bea48a5a75a84414942c8a921d630067",
+                "name": "PDM: Kernel release changed",
+                "expression": "change(/Proxmox Datacenter Manager self by HTTP/pdm.kernel)=1",
+                "priority": "INFO",
+                "recovery_mode": "NONE",
+                "manual_close": "YES",
+                "description": "The running kernel release differs from the previous value (update + reboot). Close manually.",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "notice"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "c846ce4d7e814110a918e8ea4fa733bd",
+            "name": "PDM: Memory total",
+            "type": "DEPENDENT",
+            "key": "pdm.memory.total",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.memory.total"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ],
+            "units": "B"
+          },
+          {
+            "uuid": "6d81c3b6fd694b27a61b4888d6075d93",
+            "name": "PDM: Memory used",
+            "type": "DEPENDENT",
+            "key": "pdm.memory.used",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.memory.used"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ],
+            "units": "B"
+          },
+          {
+            "uuid": "bf1569ad914c40c7b598d9dbbefae181",
+            "name": "PDM: Memory free",
+            "type": "DEPENDENT",
+            "key": "pdm.memory.free",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.memory.free"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ],
+            "units": "B"
+          },
+          {
+            "uuid": "892351e1959c45fd8ae226b1629a67c5",
+            "name": "PDM: Memory used percent",
+            "type": "DEPENDENT",
+            "key": "pdm.memory.pused",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JAVASCRIPT",
+                "parameters": [
+                  "var d=JSON.parse(value).data, o=d && d.memory; if(!o || typeof o.total!=='number' || typeof o.used!=='number' || o.total<0 || o.used<0) throw 'Missing or invalid counters'; if(o.total===0) throw 'Invalid total'; return 100*o.used/o.total;"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ],
+            "units": "%",
+            "triggers": [
+              {
+                "uuid": "70113e3398524d62895cc07670ec304e",
+                "name": "PDM: Memory usage high",
+                "expression": "min(/Proxmox Datacenter Manager self by HTTP/pdm.memory.pused,5m)>{$PDM.MEMORY.WARN} and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "WARNING",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "capacity"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "8e5e781af1ac4994a617a9e778da9a96",
+            "name": "PDM: Swap total",
+            "type": "DEPENDENT",
+            "key": "pdm.swap.total",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.swap.total"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ],
+            "units": "B"
+          },
+          {
+            "uuid": "dc73c1c3115746f3b011b39ccf3a4bfe",
+            "name": "PDM: Swap used",
+            "type": "DEPENDENT",
+            "key": "pdm.swap.used",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.swap.used"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ],
+            "units": "B"
+          },
+          {
+            "uuid": "d65cfc3dd9b742ebac0303749761a4b5",
+            "name": "PDM: Swap free",
+            "type": "DEPENDENT",
+            "key": "pdm.swap.free",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.swap.free"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ],
+            "units": "B"
+          },
+          {
+            "uuid": "f7cf99c8c67c437b91fefd12701af92a",
+            "name": "PDM: Swap used percent",
+            "type": "DEPENDENT",
+            "key": "pdm.swap.pused",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JAVASCRIPT",
+                "parameters": [
+                  "var d=JSON.parse(value).data, o=d && d.swap; if(!o || typeof o.total!=='number' || typeof o.used!=='number' || o.total<0 || o.used<0) throw 'Missing or invalid counters'; if(o.total===0) return 0; return 100*o.used/o.total;"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ],
+            "units": "%",
+            "triggers": [
+              {
+                "uuid": "57d761cad8d44d5d8257a0e192607656",
+                "name": "PDM: Swap usage high",
+                "expression": "min(/Proxmox Datacenter Manager self by HTTP/pdm.swap.pused,10m)>{$PDM.SWAP.WARN} and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "WARNING",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "capacity"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "7090f23c3e2446c9aca81b8f152a329a",
+            "name": "PDM: Root filesystem total",
+            "type": "DEPENDENT",
+            "key": "pdm.root.total",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.root.total"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "units": "B"
+          },
+          {
+            "uuid": "e2aaeed944324089abc763653a4b0601",
+            "name": "PDM: Root filesystem used",
+            "type": "DEPENDENT",
+            "key": "pdm.root.used",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.root.used"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "units": "B"
+          },
+          {
+            "uuid": "38334e77278f4624aa03796e88cd74c4",
+            "name": "PDM: Root filesystem avail",
+            "type": "DEPENDENT",
+            "key": "pdm.root.avail",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data.root.avail"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "units": "B"
+          },
+          {
+            "uuid": "9435d9d2e25944bc9b09cdb2e8487823",
+            "name": "PDM: Root filesystem used percent",
+            "type": "DEPENDENT",
+            "key": "pdm.root.pused",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.status.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JAVASCRIPT",
+                "parameters": [
+                  "var d=JSON.parse(value).data, o=d && d.root; if(!o || typeof o.total!=='number' || typeof o.used!=='number' || o.total<0 || o.used<0) throw 'Missing or invalid counters'; if(o.total===0) throw 'Invalid total'; return 100*o.used/o.total;"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "units": "%",
+            "triggers": [
+              {
+                "uuid": "5fa2d7e186b040448025d74165fc2239",
+                "name": "PDM: Root filesystem usage warn",
+                "expression": "min(/Proxmox Datacenter Manager self by HTTP/pdm.root.pused,5m)>{$PDM.ROOT.WARN} and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "WARNING",
+                "dependencies": [
+                  {
+                    "name": "PDM: Root filesystem usage crit",
+                    "expression": "min(/Proxmox Datacenter Manager self by HTTP/pdm.root.pused,5m)>{$PDM.ROOT.CRIT} and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "capacity"
+                  }
+                ]
+              },
+              {
+                "uuid": "9a18068a5c544b28a1f098591c7b1f09",
+                "name": "PDM: Root filesystem usage crit",
+                "expression": "min(/Proxmox Datacenter Manager self by HTTP/pdm.root.pused,5m)>{$PDM.ROOT.CRIT} and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "HIGH",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "capacity"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "71e7dcb829974ec3937bc07ed40c2e99",
+            "name": "PDM: Get local node RRD",
+            "type": "HTTP_AGENT",
+            "key": "pdm.rrd.get",
+            "delay": "{$PDM.INTERVAL}",
+            "history": "0",
+            "trends": "0",
+            "value_type": "TEXT",
+            "url": "{$PDM.URL}/api2/json/nodes/localhost/rrddata?timeframe=hour&cf=AVERAGE",
+            "request_method": "GET",
+            "retrieve_mode": "BOTH",
+            "output_format": "RAW",
+            "status_codes": "",
+            "follow_redirects": "NO",
+            "timeout": "15s",
+            "verify_peer": "NO",
+            "verify_host": "NO",
+            "headers": [
+              {
+                "name": "Authorization",
+                "value": "PDMAPIToken={$PDM.TOKEN.ID}:{$PDM.TOKEN.SECRET}"
+              },
+              {
+                "name": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "preprocessing": [
+              {
+                "type": "CHECK_NOT_SUPPORTED",
+                "parameters": [
+                  "-1"
+                ],
+                "error_handler": "CUSTOM_VALUE",
+                "error_handler_params": "TRANSPORT-ERROR"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "raw"
+              }
+            ],
+            "description": "GET only; localhost refers to the PDM host itself. Headers and body are both retrieved and any HTTP status is accepted, so the dependent \"Local node RRD latest values\" item can tell 401/403/404/5xx apart from transport failures (DNS, TLS, timeout), which are replaced by the marker TRANSPORT-ERROR. No managed resources are queried."
+          },
+          {
+            "uuid": "2b30573a10644a93afda424bf8dd4eb8",
+            "name": "PDM: Local node RRD latest values",
+            "type": "DEPENDENT",
+            "key": "pdm.rrd.body",
+            "delay": "0",
+            "history": "0",
+            "trends": "0",
+            "value_type": "TEXT",
+            "master_item": {
+              "key": "pdm.rrd.get"
+            },
+            "preprocessing": [
+              {
+                "type": "JAVASCRIPT",
+                "parameters": [
+                  "\n// Split \"headers + body\" (retrieve mode BOTH) into status code and body.\n// A value that does not start with HTTP/ is the transport-error marker (no HTTP response).\n// Loops so proxy CONNECT header blocks or 1xx blocks are skipped.\nfunction split(v) {\n  var code = 0, body = String(v);\n  while (body.indexOf('HTTP/') === 0) {\n    var m = /^HTTP\\/[0-9.]+\\s+([0-9]{3})/.exec(body);\n    code = m ? parseInt(m[1], 10) : 0;\n    var i = body.search(/\\r?\\n\\r?\\n/);\n    if (i < 0) { body = ''; break; }\n    body = body.substring(i).replace(/^\\r?\\n\\r?\\n/, '');\n  }\n  return {code: code, body: body};\n}\nfunction hint(code, extra) {\n  if (code === 0) return 'No HTTP response (DNS, TLS, timeout or connection refused)';\n  if (code === 401) return 'HTTP 401: authentication failed, check token ID and secret';\n  if (code === 403) return 'HTTP 403: access denied, check Auditor ACL on /system/status for both user and token';\n  if (code === 404) return 'HTTP 404: endpoint not found, check URL and PDM version' + (extra || '');\n  return 'HTTP ' + code + ': unexpected response';\n}\n\n// Output: {\"http\":<code>,\"available\":0|1,\"data\":{<field>:<newest valid value>},\"error\":\"...\"}\n// For every field the newest non-null, non-negative value that is at most MAXAGE seconds old is used.\nvar MAXAGE = 600, SKEW = 60;\nfunction empty(code, msg) {\n  return JSON.stringify({http: code, available: 0, data: {}, error: msg});\n}\ntry {\n  var r = split(value);\n  if (r.code !== 200) return empty(r.code, hint(r.code, ' (local RRD needs PDM 1.1+)'));\n  var b;\n  try { b = JSON.parse(r.body); } catch (e) { b = null; }\n  if (!b || !Array.isArray(b.data)) return empty(200, 'HTTP 200 but RRD response has no data array, check URL');\n  var now = Math.floor(Date.now() / 1000), newest = {}, out = {}, n = 0;\n  for (var i = 0; i < b.data.length; i++) {\n    var p = b.data[i];\n    if (!p || typeof p.time !== 'number' || p.time > now + SKEW || now - p.time > MAXAGE) continue;\n    for (var k in p) {\n      if (k === 'time') continue;\n      var x = p[k];\n      if (typeof x !== 'number' || !isFinite(x) || x < 0) continue;\n      if (!(k in newest) || p.time > newest[k]) {\n        if (!(k in newest)) n++;\n        newest[k] = p.time;\n        out[k] = x;\n      }\n    }\n  }\n  if (n === 0) return empty(200, 'No RRD data point newer than 10 minutes, check clock sync and PDM version (1.1+)');\n  return JSON.stringify({http: 200, available: 1, data: out});\n} catch (e) {\n  return empty(0, 'Preprocessing failure: ' + e);\n}\n"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "raw"
+              }
+            ],
+            "description": "Newest valid value per RRD field (non-null, non-negative, at most 10 minutes old), as {\"http\":..,\"available\":0|1,\"data\":{field:value}}. One script parses the RRD response for all RRD items."
+          },
+          {
+            "uuid": "7714e1bdb16f4c30b71fef38f3025773",
+            "name": "PDM: Recent local RRD available",
+            "type": "DEPENDENT",
+            "key": "pdm.rrd.available",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.rrd.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.available"
+                ],
+                "error_handler": "CUSTOM_VALUE",
+                "error_handler_params": "0"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "availability"
+              }
+            ],
+            "triggers": [
+              {
+                "uuid": "4a6b8c4a475e4df084413b5b4b2799df",
+                "name": "PDM: Local RRD unavailable or stale",
+                "expression": "max(/Proxmox Datacenter Manager self by HTTP/pdm.rrd.available,{$PDM.RRD.WINDOW})=0 and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "WARNING",
+                "description": "No recent RRD data. See item \"PDM: Local RRD request result\" for the reason. Local RRD requires PDM 1.1+.",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "availability"
+                  }
+                ]
+              },
+              {
+                "uuid": "1f9e8d58fd224dbab4a753a297d48841",
+                "name": "PDM: No local RRD samples",
+                "expression": "nodata(/Proxmox Datacenter Manager self by HTTP/pdm.rrd.available,{$PDM.RRD.NODATA})=1 and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "WARNING",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "availability"
+                  }
+                ]
+              }
+            ],
+            "description": "1 = at least one RRD field has a value at most 10 minutes old. Deliberately independent of individual field names, so a field that is absent on some layouts never raises an alert."
+          },
+          {
+            "uuid": "2ee3bf74f32848ce89cc121b954a9762",
+            "name": "PDM: Local RRD request result",
+            "type": "DEPENDENT",
+            "key": "pdm.rrd.result",
+            "delay": "0",
+            "history": "7d",
+            "trends": "0",
+            "value_type": "TEXT",
+            "master_item": {
+              "key": "pdm.rrd.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.error"
+                ],
+                "error_handler": "CUSTOM_VALUE",
+                "error_handler_params": "OK"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "availability"
+              }
+            ],
+            "description": "OK, or the reason the local RRD request returned no recent data."
+          },
+          {
+            "uuid": "9ed54dfaff61461f84e94487afc64e96",
+            "name": "PDM: Network inbound",
+            "type": "DEPENDENT",
+            "key": "pdm.rrd.net-in",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.rrd.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data['net-in']"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "network"
+              }
+            ],
+            "units": "Bps",
+            "description": "Newest non-null RRD value of this field, at most 10 minutes old (see \"PDM: Local node RRD latest values\"). The API already provides a rate: do not apply change-per-second. A missing field is discarded, never converted to zero. PDM 1.1+; root disk I/O may be absent for unsupported storage layouts."
+          },
+          {
+            "uuid": "14da135477ac47619dded37210723a0c",
+            "name": "PDM: Network outbound",
+            "type": "DEPENDENT",
+            "key": "pdm.rrd.net-out",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.rrd.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data['net-out']"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "network"
+              }
+            ],
+            "units": "Bps",
+            "description": "Newest non-null RRD value of this field, at most 10 minutes old (see \"PDM: Local node RRD latest values\"). The API already provides a rate: do not apply change-per-second. A missing field is discarded, never converted to zero. PDM 1.1+; root disk I/O may be absent for unsupported storage layouts."
+          },
+          {
+            "uuid": "d3e99821b5ba4168bc91bf1f79be4585",
+            "name": "PDM: Root disk read rate",
+            "type": "DEPENDENT",
+            "key": "pdm.rrd.disk-read",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.rrd.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data['disk-read']"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "units": "Bps",
+            "description": "Newest non-null RRD value of this field, at most 10 minutes old (see \"PDM: Local node RRD latest values\"). The API already provides a rate: do not apply change-per-second. A missing field is discarded, never converted to zero. PDM 1.1+; root disk I/O may be absent for unsupported storage layouts."
+          },
+          {
+            "uuid": "4742639abdce445fb659bcbbf210220b",
+            "name": "PDM: Root disk write rate",
+            "type": "DEPENDENT",
+            "key": "pdm.rrd.disk-write",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.rrd.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data['disk-write']"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "units": "Bps",
+            "description": "Newest non-null RRD value of this field, at most 10 minutes old (see \"PDM: Local node RRD latest values\"). The API already provides a rate: do not apply change-per-second. A missing field is discarded, never converted to zero. PDM 1.1+; root disk I/O may be absent for unsupported storage layouts."
+          },
+          {
+            "uuid": "7bad13c7fd594ee588fa33f2f057bc2f",
+            "name": "PDM: Root disk read IOPS",
+            "type": "DEPENDENT",
+            "key": "pdm.rrd.disk-read-iops",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.rrd.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data['disk-read-iops']"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "units": "!iops",
+            "description": "Newest non-null RRD value of this field, at most 10 minutes old (see \"PDM: Local node RRD latest values\"). The API already provides a rate: do not apply change-per-second. A missing field is discarded, never converted to zero. PDM 1.1+; root disk I/O may be absent for unsupported storage layouts."
+          },
+          {
+            "uuid": "953b8826cda141a2bf8246abbaef205d",
+            "name": "PDM: Root disk write IOPS",
+            "type": "DEPENDENT",
+            "key": "pdm.rrd.disk-write-iops",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.rrd.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.data['disk-write-iops']"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "units": "!iops",
+            "description": "Newest non-null RRD value of this field, at most 10 minutes old (see \"PDM: Local node RRD latest values\"). The API already provides a rate: do not apply change-per-second. A missing field is discarded, never converted to zero. PDM 1.1+; root disk I/O may be absent for unsupported storage layouts."
+          },
+          {
+            "uuid": "52acd8c7323e5f6196bebfbcc5930992",
+            "name": "PDM: Get certificate info",
+            "type": "HTTP_AGENT",
+            "key": "pdm.cert.get",
+            "delay": "{$PDM.CERT.INTERVAL}",
+            "history": "0",
+            "trends": "0",
+            "value_type": "TEXT",
+            "url": "{$PDM.URL}/api2/json/nodes/localhost/certificates/info",
+            "request_method": "GET",
+            "retrieve_mode": "BOTH",
+            "output_format": "RAW",
+            "status_codes": "",
+            "follow_redirects": "NO",
+            "timeout": "15s",
+            "verify_peer": "NO",
+            "verify_host": "NO",
+            "headers": [
+              {
+                "name": "Authorization",
+                "value": "PDMAPIToken={$PDM.TOKEN.ID}:{$PDM.TOKEN.SECRET}"
+              },
+              {
+                "name": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "preprocessing": [
+              {
+                "type": "CHECK_NOT_SUPPORTED",
+                "parameters": [
+                  "-1"
+                ],
+                "error_handler": "CUSTOM_VALUE",
+                "error_handler_params": "TRANSPORT-ERROR"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "raw"
+              }
+            ],
+            "description": "GET only. Reads the certificate PDM serves on its API/web port (self-signed, custom or ACME); any valid token may read it. Transport failures are replaced by the marker TRANSPORT-ERROR."
+          },
+          {
+            "uuid": "6f0ad3655235592fb817e0daef3872c6",
+            "name": "PDM: Certificate info payload",
+            "type": "DEPENDENT",
+            "key": "pdm.cert.body",
+            "delay": "0",
+            "history": "0",
+            "trends": "0",
+            "value_type": "TEXT",
+            "master_item": {
+              "key": "pdm.cert.get"
+            },
+            "preprocessing": [
+              {
+                "type": "JAVASCRIPT",
+                "parameters": [
+                  "\n// Split \"headers + body\" (retrieve mode BOTH) into status code and body.\n// A value that does not start with HTTP/ is the transport-error marker (no HTTP response).\n// Loops so proxy CONNECT header blocks or 1xx blocks are skipped.\nfunction split(v) {\n  var code = 0, body = String(v);\n  while (body.indexOf('HTTP/') === 0) {\n    var m = /^HTTP\\/[0-9.]+\\s+([0-9]{3})/.exec(body);\n    code = m ? parseInt(m[1], 10) : 0;\n    var i = body.search(/\\r?\\n\\r?\\n/);\n    if (i < 0) { body = ''; break; }\n    body = body.substring(i).replace(/^\\r?\\n\\r?\\n/, '');\n  }\n  return {code: code, body: body};\n}\nfunction hint(code, extra) {\n  if (code === 0) return 'No HTTP response (DNS, TLS, timeout or connection refused)';\n  if (code === 401) return 'HTTP 401: authentication failed, check token ID and secret';\n  if (code === 403) return 'HTTP 403: access denied, check Auditor ACL on /system/status for both user and token';\n  if (code === 404) return 'HTTP 404: endpoint not found, check URL and PDM version' + (extra || '');\n  return 'HTTP ' + code + ': unexpected response';\n}\n\n// Output: {\"http\":200,\"notafter\":<epoch>,\"days\":<days left>,\"subject\":\"..\",\"issuer\":\"..\"}\n// or {\"http\":<code>,\"error\":\"<reason>\"} when the request failed or has no expiry date.\ntry {\n  var r = split(value);\n  if (r.code !== 200) return JSON.stringify({http: r.code, error: hint(r.code)});\n  var b;\n  try { b = JSON.parse(r.body); } catch (e) { b = null; }\n  var c = b && Array.isArray(b.data) ? b.data[0] : null;\n  if (!c || typeof c.notafter !== 'number') {\n    return JSON.stringify({http: 200, error: 'HTTP 200 but response has no certificate expiry date, check URL'});\n  }\n  var now = Math.floor(Date.now() / 1000);\n  return JSON.stringify({http: 200, notafter: c.notafter, days: Math.floor((c.notafter - now) / 86400),\n    subject: String(c.subject || ''), issuer: String(c.issuer || '')});\n} catch (e) {\n  return JSON.stringify({http: 0, error: 'Preprocessing failure: ' + e});\n}\n"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "raw"
+              }
+            ],
+            "description": "Parsed certificate info: {\"http\":..,\"notafter\":..,\"days\":..,\"subject\":..,\"issuer\":..}, or {\"http\":<code>,\"error\":\"<reason>\"} on failure."
+          },
+          {
+            "uuid": "bc563ea26ec25ceb83a626af2e12e0f4",
+            "name": "PDM: Certificate expires on",
+            "type": "DEPENDENT",
+            "key": "pdm.cert.expires",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.cert.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.notafter"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "certificate"
+              }
+            ],
+            "units": "unixtime"
+          },
+          {
+            "uuid": "b249e7d0e9d45d599bc3aabdcb11942a",
+            "name": "PDM: Certificate days left",
+            "type": "DEPENDENT",
+            "key": "pdm.cert.days",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "master_item": {
+              "key": "pdm.cert.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.days"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "certificate"
+              }
+            ],
+            "units": "d",
+            "description": "Whole days until the certificate expires; negative once expired.",
+            "triggers": [
+              {
+                "uuid": "8fe0af213641547da34bb90b3d6bd3b5",
+                "name": "PDM: Certificate expires in less than {$PDM.CERT.EXPIRY.WARN} days",
+                "expression": "last(/Proxmox Datacenter Manager self by HTTP/pdm.cert.days)<{$PDM.CERT.EXPIRY.WARN}",
+                "priority": "WARNING",
+                "description": "Renew the PDM certificate (ACME renews automatically 30 days before expiry; check the ACME task log if this persists).",
+                "dependencies": [
+                  {
+                    "name": "PDM: Certificate expires in less than {$PDM.CERT.EXPIRY.CRIT} days",
+                    "expression": "last(/Proxmox Datacenter Manager self by HTTP/pdm.cert.days)<{$PDM.CERT.EXPIRY.CRIT}"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "security"
+                  }
+                ]
+              },
+              {
+                "uuid": "5f7fa68c8f585f39bf0ff3e75580e38b",
+                "name": "PDM: Certificate expires in less than {$PDM.CERT.EXPIRY.CRIT} days",
+                "expression": "last(/Proxmox Datacenter Manager self by HTTP/pdm.cert.days)<{$PDM.CERT.EXPIRY.CRIT}",
+                "priority": "HIGH",
+                "description": "Browsers and API clients that verify TLS will reject PDM once the certificate expires.",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "security"
+                  }
+                ]
+              },
+              {
+                "uuid": "3dc4916e523c5693ab6c5b80645ce77a",
+                "name": "PDM: Certificate info unavailable",
+                "expression": "nodata(/Proxmox Datacenter Manager self by HTTP/pdm.cert.days,{$PDM.CERT.NODATA})=1 and last(/Proxmox Datacenter Manager self by HTTP/pdm.api.available)=1",
+                "priority": "WARNING",
+                "description": "No certificate expiry date for {$PDM.CERT.NODATA} while the status API works. See item \"PDM: Certificate request result\".",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "availability"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "fcc5760748d9523b90019e350cee46de",
+            "name": "PDM: Certificate subject",
+            "type": "DEPENDENT",
+            "key": "pdm.cert.subject",
+            "delay": "0",
+            "history": "7d",
+            "trends": "0",
+            "value_type": "CHAR",
+            "master_item": {
+              "key": "pdm.cert.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.subject"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "certificate"
+              }
+            ]
+          },
+          {
+            "uuid": "e07c14fb04ab57a4b21c6649f6d5b267",
+            "name": "PDM: Certificate issuer",
+            "type": "DEPENDENT",
+            "key": "pdm.cert.issuer",
+            "delay": "0",
+            "history": "7d",
+            "trends": "0",
+            "value_type": "CHAR",
+            "master_item": {
+              "key": "pdm.cert.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.issuer"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "certificate"
+              }
+            ],
+            "description": "Equal to the subject for the default self-signed certificate."
+          },
+          {
+            "uuid": "65ef055ad05e5ff8b9c5e7d05a2b473f",
+            "name": "PDM: Certificate request result",
+            "type": "DEPENDENT",
+            "key": "pdm.cert.result",
+            "delay": "0",
+            "history": "7d",
+            "trends": "0",
+            "value_type": "TEXT",
+            "master_item": {
+              "key": "pdm.cert.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.error"
+                ],
+                "error_handler": "CUSTOM_VALUE",
+                "error_handler_params": "OK"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "availability"
+              }
+            ],
+            "description": "OK, or the reason the certificate request failed. Only changes (plus a daily heartbeat) are stored."
+          }
+        ],
+        "macros": [
+          {
+            "macro": "{$PDM.URL}",
+            "value": "https://pdm.example.net:8443",
+            "description": "PDM base HTTPS URL, without a trailing slash or /api2/json. Use a certificate-matching DNS name if TLS verification is enabled."
+          },
+          {
+            "macro": "{$PDM.TOKEN.ID}",
+            "value": "zabbix@pdm!monitoring",
+            "description": "PDM API token ID; both user and token need Auditor on /system/status."
+          },
+          {
+            "macro": "{$PDM.TOKEN.SECRET}",
+            "value": "",
+            "description": "PDM API token secret.",
+            "type": "SECRET_TEXT"
+          },
+          {
+            "macro": "{$PDM.INTERVAL}",
+            "value": "1m",
+            "description": "Poll interval for the status and RRD requests (RRD resolution is 1 minute)."
+          },
+          {
+            "macro": "{$PDM.FAIL.WINDOW}",
+            "value": "3m",
+            "description": "Status request must fail (or the payload be incomplete) for this whole window before alerting."
+          },
+          {
+            "macro": "{$PDM.NODATA}",
+            "value": "5m",
+            "description": "Alert when no status result arrives for this long. Keep it above {$PDM.INTERVAL}."
+          },
+          {
+            "macro": "{$PDM.RRD.WINDOW}",
+            "value": "5m",
+            "description": "Local RRD must be unavailable for this whole window before alerting."
+          },
+          {
+            "macro": "{$PDM.RRD.NODATA}",
+            "value": "10m",
+            "description": "Alert when no RRD result arrives for this long. Keep it above {$PDM.INTERVAL}."
+          },
+          {
+            "macro": "{$PDM.UPTIME.MIN}",
+            "value": "600",
+            "description": "Seconds of uptime below which \"Recently restarted\" is raised."
+          },
+          {
+            "macro": "{$PDM.CPU.WARN}",
+            "value": "90",
+            "description": "CPU utilization warning percent, sustained 5m."
+          },
+          {
+            "macro": "{$PDM.MEMORY.WARN}",
+            "value": "90",
+            "description": "Memory used/total warning percent, sustained 5m. This is API used memory, not Linux MemAvailable."
+          },
+          {
+            "macro": "{$PDM.SWAP.WARN}",
+            "value": "50",
+            "description": "Swap used/total warning percent, sustained 10m; no swap yields 0%."
+          },
+          {
+            "macro": "{$PDM.ROOT.WARN}",
+            "value": "80",
+            "description": "Root filesystem used/total warning percent, sustained 5m."
+          },
+          {
+            "macro": "{$PDM.ROOT.CRIT}",
+            "value": "90",
+            "description": "Root filesystem used/total critical percent, sustained 5m."
+          },
+          {
+            "macro": "{$PDM.IOWAIT.WARN}",
+            "value": "30",
+            "description": "CPU IO wait warning percent, averaged over 10m."
+          },
+          {
+            "macro": "{$PDM.LOAD.WARN}",
+            "value": "2",
+            "description": "5-minute load average divided by logical CPUs, averaged over 10m."
+          },
+          {
+            "macro": "{$PDM.CERT.INTERVAL}",
+            "value": "1h",
+            "description": "Poll interval for the certificate info request."
+          },
+          {
+            "macro": "{$PDM.CERT.NODATA}",
+            "value": "3h",
+            "description": "Alert when no certificate expiry date arrives for this long. Keep it above {$PDM.CERT.INTERVAL}."
+          },
+          {
+            "macro": "{$PDM.CERT.EXPIRY.WARN}",
+            "value": "30",
+            "description": "Certificate expiry warning, in days."
+          },
+          {
+            "macro": "{$PDM.CERT.EXPIRY.CRIT}",
+            "value": "7",
+            "description": "Certificate expiry critical, in days."
+          }
+        ],
+        "tags": [
+          {
+            "tag": "class",
+            "value": "software"
+          },
+          {
+            "tag": "target",
+            "value": "proxmox-datacenter-manager"
+          },
+          {
+            "tag": "scope",
+            "value": "self-only"
+          }
+        ]
+      }
+    ],
+    "graphs": [
+      {
+        "uuid": "cc7bffda0f8a4fb1a7b6d95650d4c329",
+        "name": "PDM: CPU",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.cpu.util"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.cpu.iowait"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "e525c2cdf2d244a1b03ce2917e223df4",
+        "name": "PDM: Memory",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.memory.total"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.memory.used"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "5db7cea110ad40afb81c696bce7800d5",
+        "name": "PDM: Root filesystem",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.root.total"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.root.used"
+            }
+          },
+          {
+            "sortorder": "2",
+            "color": "2774A4",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.root.avail"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "167e5a18d2ae42d5850bb1eb761d49bc",
+        "name": "PDM: Network",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.rrd.net-in"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.rrd.net-out"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "8fc746122cd849e797e79588788f3206",
+        "name": "PDM: Root disk IO",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.rrd.disk-read"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.rrd.disk-write"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "17554b4fbae64ca296364605179eb6d7",
+        "name": "PDM: Load average",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.load.1"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.load.5"
+            }
+          },
+          {
+            "sortorder": "2",
+            "color": "2774A4",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.load.15"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "cdda900fd14b44e0afacd5b042d6078d",
+        "name": "PDM: Swap",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.swap.total"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.swap.used"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "43d29dcec8d542b6b433352a44c6dc59",
+        "name": "PDM: Root disk IOPS",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.rrd.disk-read-iops"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager self by HTTP",
+              "key": "pdm.rrd.disk-write-iops"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,3427 @@
+{
+  "zabbix_export": {
+    "version": "7.0",
+    "template_groups": [
+      {
+        "uuid": "90dd5c27b7a140cb9364e459d5e1be53",
+        "name": "Templates/Applications"
+      }
+    ],
+    "templates": [
+      {
+        "uuid": "4741b200237257c882515fa9bbd90f03",
+        "template": "Proxmox Datacenter Manager remotes by HTTP",
+        "name": "Proxmox Datacenter Manager remotes by HTTP",
+        "description": "Monitors the PVE clusters and PBS servers managed by Proxmox Datacenter Manager through a single authenticated HTTPS GET to /resources/list, so Zabbix needs no access to the hypervisors or backup servers themselves. Discovers remotes (reachability and error), PVE nodes (status, CPU, memory, uptime), VMs and containers (status, CPU, memory, container disk, uptime), PVE storage (status, usage) and PBS nodes and datastores (CPU, memory, usage, maintenance). Zabbix 7.0+. Set {$PDM.URL}, {$PDM.TOKEN.ID} and {$PDM.TOKEN.SECRET}; grant Auditor to both user and token on /resource. Can be linked to the same host as \"Proxmox Datacenter Manager self by HTTP\". TLS certificate verification (peer and host) is disabled by default so the self-signed certificate PDM ships with works out of the box; to enforce it, set \"SSL verify peer\" and \"SSL verify host\" on \"PDM: Get remote resources\" after installing the PDM CA on the Zabbix server/proxy. Data is as fresh as PDM's cache ({$PDM.RES.MAXAGE} seconds). Not covered: backup job results, replication, Ceph health, disk SMART, guest disk usage for VMs and per-guest I/O. Licensed under GPLv3.",
+        "groups": [
+          {
+            "name": "Templates/Applications"
+          }
+        ],
+        "items": [
+          {
+            "uuid": "a6f2a6271b0b51ee85b8fd23664967f5",
+            "name": "PDM: Get remote resources",
+            "type": "HTTP_AGENT",
+            "key": "pdm.res.get",
+            "delay": "{$PDM.RES.INTERVAL}",
+            "history": "0",
+            "trends": "0",
+            "value_type": "TEXT",
+            "url": "{$PDM.URL}/api2/json/resources/list?max-age={$PDM.RES.MAXAGE}",
+            "request_method": "GET",
+            "retrieve_mode": "BOTH",
+            "output_format": "RAW",
+            "status_codes": "",
+            "follow_redirects": "NO",
+            "timeout": "{$PDM.RES.TIMEOUT}",
+            "verify_peer": "NO",
+            "verify_host": "NO",
+            "headers": [
+              {
+                "name": "Authorization",
+                "value": "PDMAPIToken={$PDM.TOKEN.ID}:{$PDM.TOKEN.SECRET}"
+              },
+              {
+                "name": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "preprocessing": [
+              {
+                "type": "CHECK_NOT_SUPPORTED",
+                "parameters": [
+                  "-1"
+                ],
+                "error_handler": "CUSTOM_VALUE",
+                "error_handler_params": "TRANSPORT-ERROR"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "raw"
+              }
+            ],
+            "description": "GET only. One request returns every PVE node, guest and storage and every PBS node and datastore of all remotes the token may audit, as cached by PDM (at most {$PDM.RES.MAXAGE} seconds old). Headers and body are both retrieved so the dependent \"Remote resources payload\" item can tell 401/403/404/5xx apart from transport failures, which are replaced by the marker TRANSPORT-ERROR."
+          },
+          {
+            "uuid": "68f13444d8915297a2d3a6747ffa7560",
+            "name": "PDM: Remote resources payload",
+            "type": "DEPENDENT",
+            "key": "pdm.res.body",
+            "delay": "0",
+            "history": "0",
+            "trends": "0",
+            "value_type": "TEXT",
+            "master_item": {
+              "key": "pdm.res.get"
+            },
+            "preprocessing": [
+              {
+                "type": "JAVASCRIPT",
+                "parameters": [
+                  "\n// Split \"headers + body\" (retrieve mode BOTH) into status code and body.\n// A value that does not start with HTTP/ is the transport-error marker (no HTTP response).\n// Loops so proxy CONNECT header blocks or 1xx blocks are skipped.\nfunction split(v) {\n  var code = 0, body = String(v);\n  while (body.indexOf('HTTP/') === 0) {\n    var m = /^HTTP\\/[0-9.]+\\s+([0-9]{3})/.exec(body);\n    code = m ? parseInt(m[1], 10) : 0;\n    var i = body.search(/\\r?\\n\\r?\\n/);\n    if (i < 0) { body = ''; break; }\n    body = body.substring(i).replace(/^\\r?\\n\\r?\\n/, '');\n  }\n  return {code: code, body: body};\n}\nfunction hint(code) {\n  if (code === 0) return 'No HTTP response (DNS, TLS, timeout or connection refused)';\n  if (code === 401) return 'HTTP 401: authentication failed, check token ID and secret';\n  if (code === 403) return 'HTTP 403: access denied, check Auditor ACL on /resource for both user and token';\n  if (code === 404) return 'HTTP 404: endpoint not found, check URL and PDM version';\n  return 'HTTP ' + code + ': unexpected response';\n}\nfunction num(x) { return typeof x === 'number' && isFinite(x) && x >= 0; }\nfunction put(o, k, v) { if (num(v)) o[k] = v; }\nfunction pct(o, k, used, total) { if (num(used) && num(total) && total > 0) o[k] = 100 * used / total; }\nfunction str(x) { return typeof x === 'string' && x !== ''; }\n// Host metrics shared by PVE nodes, guests and PBS nodes. cpu is a 0..1 fraction of maxcpu.\nfunction load(e, x) {\n  if (num(x.cpu)) e.cpu = 100 * x.cpu;\n  put(e, 'cpus', x.maxcpu);\n  put(e, 'mem', x.mem);\n  put(e, 'maxmem', x.maxmem);\n  pct(e, 'mempused', x.mem, x.maxmem);\n  put(e, 'uptime', x.uptime);\n}\n\n// Output: {\"http\":200,\"summary\":{..},\"remote\":{<remote>:{..}},\"node\":{<remote>/<node>:{..}},\n//   \"guest\":{<remote>/<vmid>:{..}},\"storage\":{<key>:{..}},\"pbsnode\":{<remote>/<name>:{..}},\n//   \"datastore\":{<remote>/<name>:{..}},\"lld\":{<kind>:[{\"{#MACRO}\":..}]}}\n// or {\"http\":<code>,\"error\":\"<reason>\"} when the request failed. Fields that are missing or invalid\n// are left out, so the dependent items discard them instead of storing zero.\ntry {\n  var r = split(value);\n  if (r.code !== 200) return JSON.stringify({http: r.code, error: hint(r.code)});\n  var b;\n  try { b = JSON.parse(r.body); } catch (e) { b = null; }\n  if (!b || !Array.isArray(b.data)) {\n    return JSON.stringify({http: 200, error: 'HTTP 200 but response has no data array, check URL'});\n  }\n  var s = {remotes: 0, remotes_failed: 0, pve_nodes_online: 0, pve_nodes_down: 0,\n    qemu_running: 0, qemu_stopped: 0, lxc_running: 0, lxc_stopped: 0,\n    storage_available: 0, storage_unavailable: 0, pbs_datastores: 0, pbs_datastores_maintenance: 0,\n    pve_mem_used: 0, pve_mem_total: 0, pve_storage_used: 0, pve_storage_total: 0,\n    pbs_storage_used: 0, pbs_storage_total: 0};\n  var o = {http: 200, summary: s, remote: {}, node: {}, guest: {}, storage: {}, pbsnode: {}, datastore: {}};\n  var lld = {remote: [], node: [], guest: [], storage: [], pbsnode: [], datastore: []};\n  var cpuUsed = 0, cpuTotal = 0;\n  for (var i = 0; i < b.data.length; i++) {\n    var rr = b.data[i];\n    if (!rr || !str(rr.remote) || o.remote[rr.remote]) continue;\n    var rn = rr.remote, err = str(rr.error) ? rr.error : null;\n    s.remotes++;\n    if (err) s.remotes_failed++;\n    o.remote[rn] = {reachable: err ? 0 : 1, error: err || 'OK'};\n    lld.remote.push({'{#REMOTE}': rn, '{#KEY}': rn});\n    var res = Array.isArray(rr.resources) ? rr.resources : [];\n    for (var j = 0; j < res.length; j++) {\n      var x = res[j], k, e;\n      if (!x || typeof x.type !== 'string') continue;\n      if (x.type === 'pve-node' && str(x.node)) {\n        k = rn + '/' + x.node;\n        if (o.node[k]) continue;\n        e = {status: x.status === 'online' ? 1 : x.status === 'offline' ? 0 : 2};\n        // An offline node reports zeros, so metrics are only kept while online.\n        if (e.status === 1) {\n          s.pve_nodes_online++;\n          load(e, x);\n          if (num(x.cpu) && num(x.maxcpu)) { cpuUsed += x.cpu * x.maxcpu; cpuTotal += x.maxcpu; }\n          if (num(x.mem) && num(x.maxmem)) { s.pve_mem_used += x.mem; s.pve_mem_total += x.maxmem; }\n        } else {\n          s.pve_nodes_down++;\n        }\n        o.node[k] = e;\n        lld.node.push({'{#REMOTE}': rn, '{#NODE}': x.node, '{#KEY}': k});\n      } else if ((x.type === 'pve-qemu' || x.type === 'pve-lxc') && num(x.vmid) && x.template !== true) {\n        var gt = x.type.substring(4);\n        k = rn + '/' + x.vmid;\n        if (o.guest[k]) continue;\n        e = {status: x.status === 'running' ? 1 : x.status === 'stopped' ? 0 : 2, node: str(x.node) ? x.node : 'unknown'};\n        if (e.status === 1) {\n          s[gt + '_running']++;\n          load(e, x);\n          // QEMU guests report disk 0 without a guest agent, so disk usage is only kept for LXC.\n          if (gt === 'lxc') {\n            put(e, 'disk', x.disk);\n            put(e, 'maxdisk', x.maxdisk);\n            pct(e, 'diskpused', x.disk, x.maxdisk);\n          }\n        } else if (e.status === 0) {\n          s[gt + '_stopped']++;\n        }\n        o.guest[k] = e;\n        lld.guest.push({'{#REMOTE}': rn, '{#VMID}': String(x.vmid), '{#NAME}': str(x.name) ? x.name : String(x.vmid),\n          '{#TYPE}': gt, '{#KEY}': k});\n      } else if (x.type === 'pve-storage' && str(x.storage) && str(x.node)) {\n        // Shared storage is listed once per node; keep one entry per remote, preferring an available one.\n        var shared = x.shared === true;\n        k = shared ? rn + '/' + x.storage : rn + '/' + x.node + '/' + x.storage;\n        var prev = o.storage[k], st = x.status === 'available' ? 1 : 2;\n        if (prev && (prev.status === 1 || st !== 1)) continue;\n        e = {status: st};\n        if (st === 1) {\n          put(e, 'used', x.disk);\n          put(e, 'total', x.maxdisk);\n          pct(e, 'pused', x.disk, x.maxdisk);\n        }\n        if (!prev) lld.storage.push({'{#REMOTE}': rn, '{#STORAGE}': x.storage, '{#NODE}': shared ? 'shared' : x.node, '{#KEY}': k});\n        o.storage[k] = e;\n      } else if (x.type === 'pbs-node') {\n        var nn = str(x.name) ? x.name : 'localhost';\n        k = rn + '/' + nn;\n        if (o.pbsnode[k]) continue;\n        e = {};\n        load(e, x);\n        o.pbsnode[k] = e;\n        lld.pbsnode.push({'{#REMOTE}': rn, '{#NODE}': nn, '{#KEY}': k});\n      } else if (x.type === 'pbs-datastore' && str(x.name)) {\n        k = rn + '/' + x.name;\n        if (o.datastore[k]) continue;\n        e = {maintenance: str(x.maintenance) ? 1 : 0};\n        put(e, 'used', x.disk);\n        put(e, 'total', x.maxdisk);\n        pct(e, 'pused', x.disk, x.maxdisk);\n        s.pbs_datastores++;\n        if (e.maintenance) s.pbs_datastores_maintenance++;\n        if (num(x.disk) && num(x.maxdisk)) { s.pbs_storage_used += x.disk; s.pbs_storage_total += x.maxdisk; }\n        o.datastore[k] = e;\n        lld.datastore.push({'{#REMOTE}': rn, '{#DATASTORE}': x.name, '{#KEY}': k});\n      }\n    }\n  }\n  for (var sk in o.storage) {\n    var se = o.storage[sk];\n    if (se.status === 1) {\n      s.storage_available++;\n      if (num(se.used) && num(se.total)) { s.pve_storage_used += se.used; s.pve_storage_total += se.total; }\n    } else {\n      s.storage_unavailable++;\n    }\n  }\n  if (cpuTotal > 0) s.pve_cpu_util = 100 * cpuUsed / cpuTotal;\n  pct(s, 'pve_mem_pused', s.pve_mem_used, s.pve_mem_total);\n  pct(s, 'pve_storage_pused', s.pve_storage_used, s.pve_storage_total);\n  pct(s, 'pbs_storage_pused', s.pbs_storage_used, s.pbs_storage_total);\n  o.lld = lld;\n  return JSON.stringify(o);\n} catch (e) {\n  return JSON.stringify({http: 0, error: 'Preprocessing failure: ' + e});\n}\n"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "raw"
+              }
+            ],
+            "description": "Normalized resources response: summary counters, one object per remote, PVE node, guest, storage, PBS node and datastore keyed by \"<remote>/<name>\", plus the discovery lists. {\"http\":<code>,\"error\":\"<reason>\"} on failure. All other items hang off this item."
+          },
+          {
+            "uuid": "36665193a5525ef1bbe44dfb80fbdfd7",
+            "name": "PDM: Resources HTTP code",
+            "type": "DEPENDENT",
+            "key": "pdm.res.http.code",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.http"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "availability"
+              }
+            ],
+            "description": "HTTP status of the resources request. 200 = OK, 401 = bad token, 403 = missing Auditor ACL on /resource, 404 = wrong URL/version, 0 = no HTTP response (DNS, TLS, timeout, refused).",
+            "triggers": [
+              {
+                "uuid": "0d60a08601f5560191b5394ec2e74b8e",
+                "name": "PDM: Resources request failed (HTTP {ITEM.LASTVALUE1}, 0 = no response)",
+                "expression": "last(/Proxmox Datacenter Manager remotes by HTTP/pdm.res.http.code)<>200 and count(/Proxmox Datacenter Manager remotes by HTTP/pdm.res.http.code,{$PDM.RES.FAIL.WINDOW},\"eq\",200)=0",
+                "priority": "HIGH",
+                "description": "The resources request has not returned HTTP 200 for the whole window, so no remote, node, guest or storage is being monitored. See item \"PDM: Resources request result\": 0 = DNS/TLS/timeout/refused (raise {$PDM.RES.TIMEOUT} if many remotes are slow), 401 = token ID/secret, 403 = Auditor ACL on /resource for both user and token, 404 = URL/PDM version.",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "availability"
+                  }
+                ]
+              },
+              {
+                "uuid": "0e018626aa6858f5b09ca9bfc79f9acf",
+                "name": "PDM: No resources samples",
+                "expression": "nodata(/Proxmox Datacenter Manager remotes by HTTP/pdm.res.http.code,{$PDM.RES.NODATA})=1",
+                "priority": "HIGH",
+                "description": "Zabbix received no result at all from the resources item (item disabled, proxy down, or {$PDM.RES.NODATA} shorter than {$PDM.RES.INTERVAL}).",
+                "tags": [
+                  {
+                    "tag": "scope",
+                    "value": "availability"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "ed38cdc3fffa5e8bb30923806ed3008f",
+            "name": "PDM: Resources request result",
+            "type": "DEPENDENT",
+            "key": "pdm.res.result",
+            "delay": "0",
+            "history": "7d",
+            "trends": "0",
+            "value_type": "TEXT",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.error"
+                ],
+                "error_handler": "CUSTOM_VALUE",
+                "error_handler_params": "OK"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "1d"
+                ]
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "availability"
+              }
+            ],
+            "description": "OK, or the reason the resources request failed. Only changes (plus a daily heartbeat) are stored."
+          },
+          {
+            "uuid": "86cb15ea4b02558d9485ec2280f0894c",
+            "name": "PDM: Remotes configured",
+            "type": "DEPENDENT",
+            "key": "pdm.res.remotes",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.remotes"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "remotes"
+              }
+            ]
+          },
+          {
+            "uuid": "fa2680b5dbe4576f82b1d73aadab6d42",
+            "name": "PDM: Remotes unreachable",
+            "type": "DEPENDENT",
+            "key": "pdm.res.remotes.failed",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.remotes_failed"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "remotes"
+              }
+            ],
+            "description": "Remotes for which PDM returned an error; see the per-remote items for the reason."
+          },
+          {
+            "uuid": "4cf1ab53c42c5099ac65ea08d233aee0",
+            "name": "PDM: PVE nodes online",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.nodes.online",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pve_nodes_online"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "nodes"
+              }
+            ]
+          },
+          {
+            "uuid": "c21c70af4f9153ed9035e77e38988b3c",
+            "name": "PDM: PVE nodes offline or unknown",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.nodes.down",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pve_nodes_down"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "nodes"
+              }
+            ]
+          },
+          {
+            "uuid": "06dde7956cfc50b295abfee7fa2a6db8",
+            "name": "PDM: VMs running",
+            "type": "DEPENDENT",
+            "key": "pdm.res.qemu.running",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.qemu_running"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "guests"
+              }
+            ],
+            "description": "Templates are not counted."
+          },
+          {
+            "uuid": "4e3198c2f8705c6eb54c916b89098de5",
+            "name": "PDM: VMs stopped",
+            "type": "DEPENDENT",
+            "key": "pdm.res.qemu.stopped",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.qemu_stopped"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "guests"
+              }
+            ],
+            "description": "Templates are not counted."
+          },
+          {
+            "uuid": "1a63cb13ab4b538b8164747a9868a19c",
+            "name": "PDM: Containers running",
+            "type": "DEPENDENT",
+            "key": "pdm.res.lxc.running",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.lxc_running"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "guests"
+              }
+            ],
+            "description": "Templates are not counted."
+          },
+          {
+            "uuid": "367fae490f9f56d0a3d235fd3524b4c0",
+            "name": "PDM: Containers stopped",
+            "type": "DEPENDENT",
+            "key": "pdm.res.lxc.stopped",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.lxc_stopped"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "guests"
+              }
+            ],
+            "description": "Templates are not counted."
+          },
+          {
+            "uuid": "506d756ddce05dd3aeea99032f8af952",
+            "name": "PDM: PVE storages available",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.storage.available",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.storage_available"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "description": "Shared storage is counted once per remote."
+          },
+          {
+            "uuid": "46ed651a38f05ee9a698ffa44befe259",
+            "name": "PDM: PVE storages unavailable",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.storage.unavailable",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.storage_unavailable"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "description": "Shared storage is counted once per remote."
+          },
+          {
+            "uuid": "53d007a1a65e5e7eb8da867c6ee457f8",
+            "name": "PDM: PVE CPU utilization",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.cpu.util",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "units": "%",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pve_cpu_util"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "cpu"
+              }
+            ],
+            "description": "Weighted by core count over all online PVE nodes."
+          },
+          {
+            "uuid": "2111f63e11c7573880cd885957c9a33c",
+            "name": "PDM: PVE memory used",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.memory.used",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "units": "B",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pve_mem_used"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ],
+            "description": "Sum over all online PVE nodes."
+          },
+          {
+            "uuid": "a671c7a4a7015e9bad2ba8608dd3daf3",
+            "name": "PDM: PVE memory total",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.memory.total",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "units": "B",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pve_mem_total"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ],
+            "description": "Sum over all online PVE nodes."
+          },
+          {
+            "uuid": "7b8f31449a505b6b8e0672f99d8e5385",
+            "name": "PDM: PVE memory used percent",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.memory.pused",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "units": "%",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pve_mem_pused"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "memory"
+              }
+            ]
+          },
+          {
+            "uuid": "c979bf50548c538891cd60acc209eabd",
+            "name": "PDM: PVE storage used",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.storage.used",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "units": "B",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pve_storage_used"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "description": "Available storages only; shared storage is counted once per remote."
+          },
+          {
+            "uuid": "4021ea0620c15c5fb69a4b2c9e3678e7",
+            "name": "PDM: PVE storage total",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.storage.total",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "units": "B",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pve_storage_total"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ],
+            "description": "Available storages only; shared storage is counted once per remote."
+          },
+          {
+            "uuid": "36d73991703e5d1b8f76230c6b47c7d7",
+            "name": "PDM: PVE storage used percent",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pve.storage.pused",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "units": "%",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pve_storage_pused"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "storage"
+              }
+            ]
+          },
+          {
+            "uuid": "63e47784d6bd5188b259a97350af8233",
+            "name": "PDM: PBS datastores",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pbs.datastores",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pbs_datastores"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "backup"
+              }
+            ]
+          },
+          {
+            "uuid": "67cd93e3b04c5c76afd28633eaf6fe27",
+            "name": "PDM: PBS datastores in maintenance",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pbs.datastores.maintenance",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pbs_datastores_maintenance"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "backup"
+              }
+            ]
+          },
+          {
+            "uuid": "d8e153e72a075871bc385c2e5c45945e",
+            "name": "PDM: PBS storage used",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pbs.storage.used",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "units": "B",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pbs_storage_used"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "backup"
+              }
+            ]
+          },
+          {
+            "uuid": "ce4f7fbb8d2e5cf594eafefed8a13280",
+            "name": "PDM: PBS storage total",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pbs.storage.total",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "UNSIGNED",
+            "units": "B",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pbs_storage_total"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "backup"
+              }
+            ]
+          },
+          {
+            "uuid": "7c7cbbf4f29e5a70a5398d944475142b",
+            "name": "PDM: PBS storage used percent",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pbs.storage.pused",
+            "delay": "0",
+            "history": "7d",
+            "trends": "365d",
+            "value_type": "FLOAT",
+            "units": "%",
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.summary.pbs_storage_pused"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              }
+            ],
+            "tags": [
+              {
+                "tag": "component",
+                "value": "backup"
+              }
+            ]
+          }
+        ],
+        "discovery_rules": [
+          {
+            "uuid": "d6568bc75b665b1d8d295b104773a02e",
+            "name": "Remote discovery",
+            "type": "DEPENDENT",
+            "key": "pdm.res.remote.discovery",
+            "delay": "0",
+            "filter": {
+              "evaltype": "AND",
+              "conditions": [
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.MATCHES}",
+                  "formulaid": "A"
+                },
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.NOT_MATCHES}",
+                  "operator": "NOT_MATCHES_REGEX",
+                  "formulaid": "B"
+                }
+              ]
+            },
+            "description": "One entry per PDM remote (PVE cluster or PBS server).",
+            "item_prototypes": [
+              {
+                "uuid": "cb6abb232e9a5096bc3615794a92f310",
+                "name": "Remote {#REMOTE}: Reachable",
+                "type": "DEPENDENT",
+                "key": "pdm.remote.reachable[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "valuemap": {
+                  "name": "PDM remote reachable"
+                },
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.remote['{#KEY}'].reachable"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "availability"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  }
+                ],
+                "description": "1 = PDM fetched the resources of this remote without error.",
+                "trigger_prototypes": [
+                  {
+                    "uuid": "b0259839cb415474bb9f327677e37a08",
+                    "name": "Remote {#REMOTE}: Unreachable from PDM",
+                    "expression": "max(/Proxmox Datacenter Manager remotes by HTTP/pdm.remote.reachable[{#KEY}],{$PDM.REMOTE.FAIL.WINDOW})=0",
+                    "priority": "HIGH",
+                    "description": "PDM could not query this remote for the whole window, so its nodes, guests and storage are not updated. See item \"Remote {#REMOTE}: Last error\".",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "availability"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "uuid": "78cfeaf8143e5610bc1179d7e1191d19",
+                "name": "Remote {#REMOTE}: Last error",
+                "type": "DEPENDENT",
+                "key": "pdm.remote.error[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "0",
+                "value_type": "TEXT",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.remote['{#KEY}'].error"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "availability"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  }
+                ],
+                "description": "OK, or the error PDM got when querying this remote. Only changes (plus a daily heartbeat) are stored."
+              }
+            ],
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.lld.remote"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "{$PDM.LLD.HEARTBEAT}"
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "905a4ba8c21f59f39cfbad9aa6019800",
+            "name": "PVE node discovery",
+            "type": "DEPENDENT",
+            "key": "pdm.res.node.discovery",
+            "delay": "0",
+            "filter": {
+              "evaltype": "AND",
+              "conditions": [
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.MATCHES}",
+                  "formulaid": "A"
+                },
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.NOT_MATCHES}",
+                  "operator": "NOT_MATCHES_REGEX",
+                  "formulaid": "B"
+                }
+              ]
+            },
+            "description": "PVE cluster nodes of all PVE remotes. Metrics are only collected while the node is online.",
+            "item_prototypes": [
+              {
+                "uuid": "81bde5498abf5c6a84494732ea5a662b",
+                "name": "Node {#REMOTE}/{#NODE}: Status",
+                "type": "DEPENDENT",
+                "key": "pdm.node.status[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "valuemap": {
+                  "name": "PDM node state"
+                },
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.node['{#KEY}'].status"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "availability"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "a01d014984d2566f8ca1b8ef2a451f92",
+                    "name": "Node {#REMOTE}/{#NODE}: Not online",
+                    "expression": "last(/Proxmox Datacenter Manager remotes by HTTP/pdm.node.status[{#KEY}])<>1 and count(/Proxmox Datacenter Manager remotes by HTTP/pdm.node.status[{#KEY}],{$PDM.NODE.FAIL.WINDOW},\"eq\",1)=0",
+                    "priority": "HIGH",
+                    "description": "The PVE cluster has not reported this node as online for the whole window.",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "availability"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "node",
+                        "value": "{#NODE}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "uuid": "1c0abc715f6b55b58c6263406d6bfc10",
+                "name": "Node {#REMOTE}/{#NODE}: CPU utilization",
+                "type": "DEPENDENT",
+                "key": "pdm.node.cpu.util[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "FLOAT",
+                "units": "%",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.node['{#KEY}'].cpu"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "cpu"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "b573a39cd75451af82f4df22c5d5a605",
+                    "name": "Node {#REMOTE}/{#NODE}: CPU utilization high",
+                    "expression": "min(/Proxmox Datacenter Manager remotes by HTTP/pdm.node.cpu.util[{#KEY}],5m)>{$PDM.NODE.CPU.WARN:\"{#KEY}\"}",
+                    "priority": "WARNING",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "performance"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "node",
+                        "value": "{#NODE}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "uuid": "5a4c6545889f50e7b5613fe4db450868",
+                "name": "Node {#REMOTE}/{#NODE}: Logical CPUs",
+                "type": "DEPENDENT",
+                "key": "pdm.node.cpu.count[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.node['{#KEY}'].cpus"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "cpu"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "d802f8ff746250d8bb001f9d39981e14",
+                "name": "Node {#REMOTE}/{#NODE}: Memory used",
+                "type": "DEPENDENT",
+                "key": "pdm.node.memory.used[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.node['{#KEY}'].mem"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "memory"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "db5661fcd13d5d8ba1696825121ac6d8",
+                "name": "Node {#REMOTE}/{#NODE}: Memory total",
+                "type": "DEPENDENT",
+                "key": "pdm.node.memory.total[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.node['{#KEY}'].maxmem"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "memory"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "27c3211bf84c5a54b0e18775b753e807",
+                "name": "Node {#REMOTE}/{#NODE}: Memory used percent",
+                "type": "DEPENDENT",
+                "key": "pdm.node.memory.pused[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "FLOAT",
+                "units": "%",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.node['{#KEY}'].mempused"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "memory"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "0b21af63625e5232bc2b62968374be5b",
+                    "name": "Node {#REMOTE}/{#NODE}: Memory usage high",
+                    "expression": "min(/Proxmox Datacenter Manager remotes by HTTP/pdm.node.memory.pused[{#KEY}],5m)>{$PDM.NODE.MEMORY.WARN:\"{#KEY}\"}",
+                    "priority": "WARNING",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "capacity"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "node",
+                        "value": "{#NODE}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "uuid": "182b19b516375082861ea5a6915cf80d",
+                "name": "Node {#REMOTE}/{#NODE}: Uptime",
+                "type": "DEPENDENT",
+                "key": "pdm.node.uptime[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "uptime",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.node['{#KEY}'].uptime"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "system"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "98a0b1ec9b0751bea3d9a83f2e6e6961",
+                    "name": "Node {#REMOTE}/{#NODE}: Recently restarted",
+                    "expression": "last(/Proxmox Datacenter Manager remotes by HTTP/pdm.node.uptime[{#KEY}])<{$PDM.UPTIME.MIN}",
+                    "priority": "WARNING",
+                    "description": "Uptime is below {$PDM.UPTIME.MIN} seconds.",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "notice"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "node",
+                        "value": "{#NODE}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ],
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.lld.node"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "{$PDM.LLD.HEARTBEAT}"
+                ]
+              }
+            ],
+            "graph_prototypes": [
+              {
+                "uuid": "6abaca47b8735b3e936319e8b2fdd0a5",
+                "name": "Node {#REMOTE}/{#NODE}: CPU utilization",
+                "graph_items": [
+                  {
+                    "sortorder": "0",
+                    "color": "199C0D",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.node.cpu.util[{#KEY}]"
+                    }
+                  }
+                ]
+              },
+              {
+                "uuid": "0254ab61d0b05fb09726fa1b3bea2955",
+                "name": "Node {#REMOTE}/{#NODE}: Memory",
+                "graph_items": [
+                  {
+                    "sortorder": "0",
+                    "color": "199C0D",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.node.memory.total[{#KEY}]"
+                    }
+                  },
+                  {
+                    "sortorder": "1",
+                    "color": "F63100",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.node.memory.used[{#KEY}]"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "268f6d33154e5d37a6959adedffae5ff",
+            "name": "PVE guest discovery",
+            "type": "DEPENDENT",
+            "key": "pdm.res.guest.discovery",
+            "delay": "0",
+            "filter": {
+              "evaltype": "AND",
+              "conditions": [
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.MATCHES}",
+                  "formulaid": "A"
+                },
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.NOT_MATCHES}",
+                  "operator": "NOT_MATCHES_REGEX",
+                  "formulaid": "B"
+                },
+                {
+                  "macro": "{#NAME}",
+                  "value": "{$PDM.LLD.GUEST.MATCHES}",
+                  "formulaid": "C"
+                },
+                {
+                  "macro": "{#NAME}",
+                  "value": "{$PDM.LLD.GUEST.NOT_MATCHES}",
+                  "formulaid": "D",
+                  "operator": "NOT_MATCHES_REGEX"
+                }
+              ]
+            },
+            "description": "QEMU VMs and LXC containers of all PVE remotes; templates are skipped. Keyed by remote and VMID, so migration between nodes keeps history. Metrics are only collected while running.",
+            "item_prototypes": [
+              {
+                "uuid": "1bb8d3b27dc251dd95bbe8bec584fc98",
+                "name": "Guest {#NAME} ({#KEY}): Status",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.status[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "valuemap": {
+                  "name": "PDM guest state"
+                },
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].status"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "availability"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "baa6e62812eb5228814fa524812777ba",
+                    "name": "Guest {#NAME} ({#KEY}): Stopped",
+                    "expression": "last(/Proxmox Datacenter Manager remotes by HTTP/pdm.guest.status[{#KEY}])=0 and count(/Proxmox Datacenter Manager remotes by HTTP/pdm.guest.status[{#KEY}],{$PDM.GUEST.STOP.WINDOW},\"eq\",1)>0 and {$PDM.GUEST.STOP.ALERT:\"{#KEY}\"}=1",
+                    "recovery_mode": "RECOVERY_EXPRESSION",
+                    "recovery_expression": "last(/Proxmox Datacenter Manager remotes by HTTP/pdm.guest.status[{#KEY}])=1",
+                    "priority": "AVERAGE",
+                    "manual_close": "YES",
+                    "description": "The guest was running within the last {$PDM.GUEST.STOP.WINDOW} and is now stopped. Guests that are already stopped when discovered do not alert. Stays open until the guest runs again; close manually after an intentional shutdown, or set {$PDM.GUEST.STOP.ALERT:\"{#KEY}\"} to 0. A guest on an offline node has state unknown and does not alert here.",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "availability"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "guest",
+                        "value": "{#NAME}"
+                      },
+                      {
+                        "tag": "guest-type",
+                        "value": "{#TYPE}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "uuid": "423d118cd1f151a086d7f381ae690502",
+                "name": "Guest {#NAME} ({#KEY}): Node",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.node[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "0",
+                "value_type": "CHAR",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].node"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "system"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ],
+                "description": "PVE node the guest is placed on. Only changes (plus a daily heartbeat) are stored."
+              },
+              {
+                "uuid": "0dfc4d6a08e85107997c6d2ab358fded",
+                "name": "Guest {#NAME} ({#KEY}): CPU utilization",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.cpu.util[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "FLOAT",
+                "units": "%",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].cpu"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "cpu"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ],
+                "description": "Percent of the guest's own vCPUs. Collected only while running."
+              },
+              {
+                "uuid": "1313cda49ec45cb4af9f70a4695adc09",
+                "name": "Guest {#NAME} ({#KEY}): vCPUs",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.cpu.count[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "FLOAT",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].cpus"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "cpu"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "1b69118cbd56538593307b4aa353768f",
+                "name": "Guest {#NAME} ({#KEY}): Memory used",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.memory.used[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].mem"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "memory"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "7f3f76b448b3578f9003cc1ea478a1e2",
+                "name": "Guest {#NAME} ({#KEY}): Memory total",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.memory.total[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].maxmem"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "memory"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "a59544239d3d5c02a13b99145ec4e046",
+                "name": "Guest {#NAME} ({#KEY}): Memory used percent",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.memory.pused[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "FLOAT",
+                "units": "%",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].mempused"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "memory"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ],
+                "description": "For VMs without the balloon driver this includes the guest page cache, so no trigger is defined."
+              },
+              {
+                "uuid": "f05abc9d42c55053a64ccc80562b22cd",
+                "name": "Guest {#NAME} ({#KEY}): Disk used",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.disk.used[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].disk"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "storage"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "2bdece85b5f35feeae3964f138af8013",
+                "name": "Guest {#NAME} ({#KEY}): Disk total",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.disk.total[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].maxdisk"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "storage"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "80977a044dcc5361b643adab9bfb7855",
+                "name": "Guest {#NAME} ({#KEY}): Disk used percent",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.disk.pused[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "FLOAT",
+                "units": "%",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].diskpused"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "storage"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ],
+                "description": "Root filesystem of the container. Not created for VMs, which report no disk usage without a guest agent.",
+                "trigger_prototypes": [
+                  {
+                    "uuid": "a4a1df582408508db3af3fdbab6a8575",
+                    "name": "Guest {#NAME} ({#KEY}): Disk usage high",
+                    "expression": "min(/Proxmox Datacenter Manager remotes by HTTP/pdm.guest.disk.pused[{#KEY}],5m)>{$PDM.GUEST.DISK.WARN:\"{#KEY}\"}",
+                    "priority": "WARNING",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "capacity"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "guest",
+                        "value": "{#NAME}"
+                      },
+                      {
+                        "tag": "guest-type",
+                        "value": "{#TYPE}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "uuid": "dc945d05f0b359e99e78bd232853aa06",
+                "name": "Guest {#NAME} ({#KEY}): Uptime",
+                "type": "DEPENDENT",
+                "key": "pdm.guest.uptime[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "uptime",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.guest['{#KEY}'].uptime"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "system"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "guest",
+                    "value": "{#NAME}"
+                  },
+                  {
+                    "tag": "guest-type",
+                    "value": "{#TYPE}"
+                  }
+                ]
+              }
+            ],
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.lld.guest"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "{$PDM.LLD.HEARTBEAT}"
+                ]
+              }
+            ],
+            "graph_prototypes": [
+              {
+                "uuid": "b68950d2976e57cfbaec928972c54772",
+                "name": "Guest {#NAME} ({#KEY}): CPU utilization",
+                "graph_items": [
+                  {
+                    "sortorder": "0",
+                    "color": "199C0D",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.guest.cpu.util[{#KEY}]"
+                    }
+                  }
+                ]
+              },
+              {
+                "uuid": "1e13bac65ff353f1baff78de6b70945e",
+                "name": "Guest {#NAME} ({#KEY}): Memory",
+                "graph_items": [
+                  {
+                    "sortorder": "0",
+                    "color": "199C0D",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.guest.memory.total[{#KEY}]"
+                    }
+                  },
+                  {
+                    "sortorder": "1",
+                    "color": "F63100",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.guest.memory.used[{#KEY}]"
+                    }
+                  }
+                ]
+              }
+            ],
+            "overrides": [
+              {
+                "name": "VM: no disk usage",
+                "step": "1",
+                "filter": {
+                  "conditions": [
+                    {
+                      "macro": "{#TYPE}",
+                      "value": "^qemu$",
+                      "formulaid": "A"
+                    }
+                  ]
+                },
+                "operations": [
+                  {
+                    "operationobject": "ITEM_PROTOTYPE",
+                    "operator": "LIKE",
+                    "value": "): Disk ",
+                    "discover": "NO_DISCOVER"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "2a469139d65d5ac8a0e36c17562698ef",
+            "name": "PVE storage discovery",
+            "type": "DEPENDENT",
+            "key": "pdm.res.storage.discovery",
+            "delay": "0",
+            "filter": {
+              "evaltype": "AND",
+              "conditions": [
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.MATCHES}",
+                  "formulaid": "A"
+                },
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.NOT_MATCHES}",
+                  "operator": "NOT_MATCHES_REGEX",
+                  "formulaid": "B"
+                },
+                {
+                  "macro": "{#STORAGE}",
+                  "value": "{$PDM.LLD.STORAGE.MATCHES}",
+                  "formulaid": "C"
+                },
+                {
+                  "macro": "{#STORAGE}",
+                  "value": "{$PDM.LLD.STORAGE.NOT_MATCHES}",
+                  "formulaid": "D",
+                  "operator": "NOT_MATCHES_REGEX"
+                }
+              ]
+            },
+            "description": "PVE storages. Shared storage is one entry per remote ({#NODE} = shared, key <remote>/<storage>); local storage is one entry per node (key <remote>/<node>/<storage>).",
+            "item_prototypes": [
+              {
+                "uuid": "c79c1ff94a325d119e0ac76df8bdfada",
+                "name": "Storage {#STORAGE} ({#REMOTE}, {#NODE}): Status",
+                "type": "DEPENDENT",
+                "key": "pdm.storage.status[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "valuemap": {
+                  "name": "PDM storage state"
+                },
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.storage['{#KEY}'].status"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "availability"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "storage",
+                    "value": "{#STORAGE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "ecc6977419015f749adc9abf89b738dd",
+                    "name": "Storage {#STORAGE} ({#REMOTE}, {#NODE}): Not available",
+                    "expression": "last(/Proxmox Datacenter Manager remotes by HTTP/pdm.storage.status[{#KEY}])<>1 and count(/Proxmox Datacenter Manager remotes by HTTP/pdm.storage.status[{#KEY}],{$PDM.STORAGE.FAIL.WINDOW},\"eq\",1)=0",
+                    "priority": "AVERAGE",
+                    "description": "PVE has not reported this storage as available for the whole window. Shared storage only alerts when no node sees it as available.",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "availability"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "storage",
+                        "value": "{#STORAGE}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "uuid": "05c75649b9535420988360511db74a38",
+                "name": "Storage {#STORAGE} ({#REMOTE}, {#NODE}): Used",
+                "type": "DEPENDENT",
+                "key": "pdm.storage.used[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.storage['{#KEY}'].used"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "storage"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "storage",
+                    "value": "{#STORAGE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "0d2cb837cf9f5eb5a184ac47b7b8ba66",
+                "name": "Storage {#STORAGE} ({#REMOTE}, {#NODE}): Total",
+                "type": "DEPENDENT",
+                "key": "pdm.storage.total[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.storage['{#KEY}'].total"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "storage"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "storage",
+                    "value": "{#STORAGE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "6eee89d71c1a5453931e563cbcea199e",
+                "name": "Storage {#STORAGE} ({#REMOTE}, {#NODE}): Used percent",
+                "type": "DEPENDENT",
+                "key": "pdm.storage.pused[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "FLOAT",
+                "units": "%",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.storage['{#KEY}'].pused"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "storage"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "storage",
+                    "value": "{#STORAGE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "197ea32c838b5d92bc5d02468e5e1829",
+                    "name": "Storage {#STORAGE} ({#REMOTE}, {#NODE}): Usage above {$PDM.STORAGE.PUSED.WARN:\"{#KEY}\"}%",
+                    "expression": "min(/Proxmox Datacenter Manager remotes by HTTP/pdm.storage.pused[{#KEY}],5m)>{$PDM.STORAGE.PUSED.WARN:\"{#KEY}\"}",
+                    "priority": "WARNING",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "capacity"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "storage",
+                        "value": "{#STORAGE}"
+                      }
+                    ]
+                  },
+                  {
+                    "uuid": "fa2df9f4e9ae55d181fb3d51154887f9",
+                    "name": "Storage {#STORAGE} ({#REMOTE}, {#NODE}): Usage above {$PDM.STORAGE.PUSED.CRIT:\"{#KEY}\"}%",
+                    "expression": "min(/Proxmox Datacenter Manager remotes by HTTP/pdm.storage.pused[{#KEY}],5m)>{$PDM.STORAGE.PUSED.CRIT:\"{#KEY}\"}",
+                    "priority": "HIGH",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "capacity"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "storage",
+                        "value": "{#STORAGE}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ],
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.lld.storage"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "{$PDM.LLD.HEARTBEAT}"
+                ]
+              }
+            ],
+            "graph_prototypes": [
+              {
+                "uuid": "8b296e00eb1152c4bf1104080159cbba",
+                "name": "Storage {#STORAGE} ({#REMOTE}, {#NODE}): Usage",
+                "graph_items": [
+                  {
+                    "sortorder": "0",
+                    "color": "199C0D",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.storage.total[{#KEY}]"
+                    }
+                  },
+                  {
+                    "sortorder": "1",
+                    "color": "F63100",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.storage.used[{#KEY}]"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "d0d852a7be9453a8b42515b60803e2ff",
+            "name": "PBS node discovery",
+            "type": "DEPENDENT",
+            "key": "pdm.res.pbsnode.discovery",
+            "delay": "0",
+            "filter": {
+              "evaltype": "AND",
+              "conditions": [
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.MATCHES}",
+                  "formulaid": "A"
+                },
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.NOT_MATCHES}",
+                  "operator": "NOT_MATCHES_REGEX",
+                  "formulaid": "B"
+                }
+              ]
+            },
+            "description": "Proxmox Backup Server hosts. Reachability is covered by the remote discovery.",
+            "item_prototypes": [
+              {
+                "uuid": "89513d44d4845eaab1cc34f63f81c9ed",
+                "name": "PBS {#REMOTE}/{#NODE}: CPU utilization",
+                "type": "DEPENDENT",
+                "key": "pdm.pbs.cpu.util[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "FLOAT",
+                "units": "%",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.pbsnode['{#KEY}'].cpu"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "cpu"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "25ae0f2500a4529fb6cf5ba4b9f6ad99",
+                    "name": "PBS {#REMOTE}/{#NODE}: CPU utilization high",
+                    "expression": "min(/Proxmox Datacenter Manager remotes by HTTP/pdm.pbs.cpu.util[{#KEY}],5m)>{$PDM.PBS.CPU.WARN:\"{#KEY}\"}",
+                    "priority": "WARNING",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "performance"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "node",
+                        "value": "{#NODE}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "uuid": "9bbd683114925856b7f68543e5472dc0",
+                "name": "PBS {#REMOTE}/{#NODE}: Logical CPUs",
+                "type": "DEPENDENT",
+                "key": "pdm.pbs.cpu.count[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.pbsnode['{#KEY}'].cpus"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "cpu"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "bb5f213ec6755cbdbbcdfd94197cd68f",
+                "name": "PBS {#REMOTE}/{#NODE}: Memory used",
+                "type": "DEPENDENT",
+                "key": "pdm.pbs.memory.used[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.pbsnode['{#KEY}'].mem"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "memory"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "2b47890f5ed8571cb70cd1693846eb9e",
+                "name": "PBS {#REMOTE}/{#NODE}: Memory total",
+                "type": "DEPENDENT",
+                "key": "pdm.pbs.memory.total[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.pbsnode['{#KEY}'].maxmem"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "memory"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "c0f5179ef91f56de9f09263b6ca111a4",
+                "name": "PBS {#REMOTE}/{#NODE}: Memory used percent",
+                "type": "DEPENDENT",
+                "key": "pdm.pbs.memory.pused[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "FLOAT",
+                "units": "%",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.pbsnode['{#KEY}'].mempused"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "memory"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "44133c164b9653b6ac3287b688203d48",
+                    "name": "PBS {#REMOTE}/{#NODE}: Memory usage high",
+                    "expression": "min(/Proxmox Datacenter Manager remotes by HTTP/pdm.pbs.memory.pused[{#KEY}],5m)>{$PDM.PBS.MEMORY.WARN:\"{#KEY}\"}",
+                    "priority": "WARNING",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "capacity"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "node",
+                        "value": "{#NODE}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "uuid": "7473f91145be555ca603a038d3775717",
+                "name": "PBS {#REMOTE}/{#NODE}: Uptime",
+                "type": "DEPENDENT",
+                "key": "pdm.pbs.uptime[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "uptime",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.pbsnode['{#KEY}'].uptime"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "system"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "node",
+                    "value": "{#NODE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "52923daaf81b531f8781971ca0e225cc",
+                    "name": "PBS {#REMOTE}/{#NODE}: Recently restarted",
+                    "expression": "last(/Proxmox Datacenter Manager remotes by HTTP/pdm.pbs.uptime[{#KEY}])<{$PDM.UPTIME.MIN}",
+                    "priority": "WARNING",
+                    "description": "Uptime is below {$PDM.UPTIME.MIN} seconds.",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "notice"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "node",
+                        "value": "{#NODE}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ],
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.lld.pbsnode"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "{$PDM.LLD.HEARTBEAT}"
+                ]
+              }
+            ],
+            "graph_prototypes": [
+              {
+                "uuid": "27fed937e4435557ba54d9d0140af771",
+                "name": "PBS {#REMOTE}/{#NODE}: CPU utilization",
+                "graph_items": [
+                  {
+                    "sortorder": "0",
+                    "color": "199C0D",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.pbs.cpu.util[{#KEY}]"
+                    }
+                  }
+                ]
+              },
+              {
+                "uuid": "9b3dfd8e633b544ca5a202ecf28dc845",
+                "name": "PBS {#REMOTE}/{#NODE}: Memory",
+                "graph_items": [
+                  {
+                    "sortorder": "0",
+                    "color": "199C0D",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.pbs.memory.total[{#KEY}]"
+                    }
+                  },
+                  {
+                    "sortorder": "1",
+                    "color": "F63100",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.pbs.memory.used[{#KEY}]"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "uuid": "05703cf35b4754169a07133023835085",
+            "name": "PBS datastore discovery",
+            "type": "DEPENDENT",
+            "key": "pdm.res.datastore.discovery",
+            "delay": "0",
+            "filter": {
+              "evaltype": "AND",
+              "conditions": [
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.MATCHES}",
+                  "formulaid": "A"
+                },
+                {
+                  "macro": "{#REMOTE}",
+                  "value": "{$PDM.LLD.REMOTE.NOT_MATCHES}",
+                  "operator": "NOT_MATCHES_REGEX",
+                  "formulaid": "B"
+                }
+              ]
+            },
+            "description": "Datastores of all PBS remotes.",
+            "item_prototypes": [
+              {
+                "uuid": "26bad42713405dada3c715f42decb111",
+                "name": "Datastore {#REMOTE}/{#DATASTORE}: Used",
+                "type": "DEPENDENT",
+                "key": "pdm.datastore.used[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.datastore['{#KEY}'].used"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "backup"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "datastore",
+                    "value": "{#DATASTORE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "150ab6b5e84a55a6ae0dc33d1bc38830",
+                "name": "Datastore {#REMOTE}/{#DATASTORE}: Total",
+                "type": "DEPENDENT",
+                "key": "pdm.datastore.total[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "units": "B",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.datastore['{#KEY}'].total"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  },
+                  {
+                    "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                    "parameters": [
+                      "1d"
+                    ]
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "backup"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "datastore",
+                    "value": "{#DATASTORE}"
+                  }
+                ]
+              },
+              {
+                "uuid": "5393810fec725cf0943d2ccccc517ea3",
+                "name": "Datastore {#REMOTE}/{#DATASTORE}: Used percent",
+                "type": "DEPENDENT",
+                "key": "pdm.datastore.pused[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "FLOAT",
+                "units": "%",
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.datastore['{#KEY}'].pused"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "backup"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "datastore",
+                    "value": "{#DATASTORE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "5f2b13d3db595b2980dd4dbe71bbfd0c",
+                    "name": "Datastore {#REMOTE}/{#DATASTORE}: Usage above {$PDM.DATASTORE.PUSED.WARN:\"{#KEY}\"}%",
+                    "expression": "min(/Proxmox Datacenter Manager remotes by HTTP/pdm.datastore.pused[{#KEY}],5m)>{$PDM.DATASTORE.PUSED.WARN:\"{#KEY}\"}",
+                    "priority": "WARNING",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "capacity"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "datastore",
+                        "value": "{#DATASTORE}"
+                      }
+                    ]
+                  },
+                  {
+                    "uuid": "8263f9eda34856c28e0e9cd0ed3fead6",
+                    "name": "Datastore {#REMOTE}/{#DATASTORE}: Usage above {$PDM.DATASTORE.PUSED.CRIT:\"{#KEY}\"}%",
+                    "expression": "min(/Proxmox Datacenter Manager remotes by HTTP/pdm.datastore.pused[{#KEY}],5m)>{$PDM.DATASTORE.PUSED.CRIT:\"{#KEY}\"}",
+                    "priority": "HIGH",
+                    "description": "Backups will fail once the datastore is full; run prune and garbage collection or extend the datastore.",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "capacity"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "datastore",
+                        "value": "{#DATASTORE}"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "uuid": "a759981db0e05f7981ce8b5246dbad80",
+                "name": "Datastore {#REMOTE}/{#DATASTORE}: Maintenance mode",
+                "type": "DEPENDENT",
+                "key": "pdm.datastore.maintenance[{#KEY}]",
+                "delay": "0",
+                "history": "7d",
+                "trends": "365d",
+                "value_type": "UNSIGNED",
+                "valuemap": {
+                  "name": "PDM datastore maintenance"
+                },
+                "master_item": {
+                  "key": "pdm.res.body"
+                },
+                "preprocessing": [
+                  {
+                    "type": "JSONPATH",
+                    "parameters": [
+                      "$.datastore['{#KEY}'].maintenance"
+                    ],
+                    "error_handler": "DISCARD_VALUE"
+                  }
+                ],
+                "tags": [
+                  {
+                    "tag": "component",
+                    "value": "backup"
+                  },
+                  {
+                    "tag": "remote",
+                    "value": "{#REMOTE}"
+                  },
+                  {
+                    "tag": "datastore",
+                    "value": "{#DATASTORE}"
+                  }
+                ],
+                "trigger_prototypes": [
+                  {
+                    "uuid": "0f681f900bb258aa9dce9298d90ff458",
+                    "name": "Datastore {#REMOTE}/{#DATASTORE}: In maintenance mode",
+                    "expression": "last(/Proxmox Datacenter Manager remotes by HTTP/pdm.datastore.maintenance[{#KEY}])=1",
+                    "priority": "INFO",
+                    "description": "The datastore is read-only or offline for maintenance; backups to it will fail.",
+                    "tags": [
+                      {
+                        "tag": "scope",
+                        "value": "notice"
+                      },
+                      {
+                        "tag": "remote",
+                        "value": "{#REMOTE}"
+                      },
+                      {
+                        "tag": "datastore",
+                        "value": "{#DATASTORE}"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ],
+            "master_item": {
+              "key": "pdm.res.body"
+            },
+            "preprocessing": [
+              {
+                "type": "JSONPATH",
+                "parameters": [
+                  "$.lld.datastore"
+                ],
+                "error_handler": "DISCARD_VALUE"
+              },
+              {
+                "type": "DISCARD_UNCHANGED_HEARTBEAT",
+                "parameters": [
+                  "{$PDM.LLD.HEARTBEAT}"
+                ]
+              }
+            ],
+            "graph_prototypes": [
+              {
+                "uuid": "bcda5e2756525d40a0e36d094af4aa3b",
+                "name": "Datastore {#REMOTE}/{#DATASTORE}: Usage",
+                "graph_items": [
+                  {
+                    "sortorder": "0",
+                    "color": "199C0D",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.datastore.total[{#KEY}]"
+                    }
+                  },
+                  {
+                    "sortorder": "1",
+                    "color": "F63100",
+                    "item": {
+                      "host": "Proxmox Datacenter Manager remotes by HTTP",
+                      "key": "pdm.datastore.used[{#KEY}]"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "tags": [
+          {
+            "tag": "class",
+            "value": "software"
+          },
+          {
+            "tag": "target",
+            "value": "proxmox-datacenter-manager"
+          },
+          {
+            "tag": "scope",
+            "value": "remotes"
+          }
+        ],
+        "macros": [
+          {
+            "macro": "{$PDM.URL}",
+            "value": "https://pdm.example.net:8443",
+            "description": "PDM base HTTPS URL, without a trailing slash or /api2/json. Same macro as the self template, so both can be linked to one host."
+          },
+          {
+            "macro": "{$PDM.TOKEN.ID}",
+            "value": "zabbix@pdm!monitoring",
+            "description": "PDM API token ID; both user and token need Auditor on /resource (and on /system/status for the self template)."
+          },
+          {
+            "macro": "{$PDM.TOKEN.SECRET}",
+            "value": "",
+            "description": "PDM API token secret.",
+            "type": "SECRET_TEXT"
+          },
+          {
+            "macro": "{$PDM.RES.INTERVAL}",
+            "value": "1m",
+            "description": "Poll interval for the resources request."
+          },
+          {
+            "macro": "{$PDM.RES.MAXAGE}",
+            "value": "30",
+            "description": "Seconds PDM may serve cached remote data before querying the remotes again."
+          },
+          {
+            "macro": "{$PDM.RES.TIMEOUT}",
+            "value": "30s",
+            "description": "Timeout of the resources request. PDM waits for the slowest remote, so keep it above its remote connect timeout."
+          },
+          {
+            "macro": "{$PDM.RES.FAIL.WINDOW}",
+            "value": "3m",
+            "description": "Resources request must fail for this whole window before alerting."
+          },
+          {
+            "macro": "{$PDM.RES.NODATA}",
+            "value": "5m",
+            "description": "Alert when no resources result arrives for this long. Keep it above {$PDM.RES.INTERVAL}."
+          },
+          {
+            "macro": "{$PDM.LLD.HEARTBEAT}",
+            "value": "1h",
+            "description": "Discovery data is only processed when it changes, or at least this often."
+          },
+          {
+            "macro": "{$PDM.LLD.REMOTE.MATCHES}",
+            "value": ".*",
+            "description": "Only discover remotes whose name matches this regex."
+          },
+          {
+            "macro": "{$PDM.LLD.REMOTE.NOT_MATCHES}",
+            "value": "CHANGE_IF_NEEDED",
+            "description": "Skip remotes whose name matches this regex."
+          },
+          {
+            "macro": "{$PDM.LLD.GUEST.MATCHES}",
+            "value": ".*",
+            "description": "Only discover guests whose name matches this regex."
+          },
+          {
+            "macro": "{$PDM.LLD.GUEST.NOT_MATCHES}",
+            "value": "CHANGE_IF_NEEDED",
+            "description": "Skip guests whose name matches this regex."
+          },
+          {
+            "macro": "{$PDM.LLD.STORAGE.MATCHES}",
+            "value": ".*",
+            "description": "Only discover PVE storages whose ID matches this regex."
+          },
+          {
+            "macro": "{$PDM.LLD.STORAGE.NOT_MATCHES}",
+            "value": "CHANGE_IF_NEEDED",
+            "description": "Skip PVE storages whose ID matches this regex."
+          },
+          {
+            "macro": "{$PDM.REMOTE.FAIL.WINDOW}",
+            "value": "5m",
+            "description": "A remote must be unreachable for this whole window before alerting."
+          },
+          {
+            "macro": "{$PDM.NODE.FAIL.WINDOW}",
+            "value": "5m",
+            "description": "A PVE node must be not online for this whole window before alerting."
+          },
+          {
+            "macro": "{$PDM.STORAGE.FAIL.WINDOW}",
+            "value": "10m",
+            "description": "A PVE storage must be unavailable for this whole window before alerting."
+          },
+          {
+            "macro": "{$PDM.UPTIME.MIN}",
+            "value": "600",
+            "description": "Seconds of uptime below which \"Recently restarted\" is raised for PVE and PBS nodes."
+          },
+          {
+            "macro": "{$PDM.NODE.CPU.WARN}",
+            "value": "90",
+            "description": "PVE node CPU warning percent, sustained 5m. Context: <remote>/<node>."
+          },
+          {
+            "macro": "{$PDM.NODE.MEMORY.WARN}",
+            "value": "90",
+            "description": "PVE node memory warning percent, sustained 5m. Context: <remote>/<node>."
+          },
+          {
+            "macro": "{$PDM.GUEST.STOP.WINDOW}",
+            "value": "1h",
+            "description": "A guest that was running within this window and is now stopped raises \"Stopped\"."
+          },
+          {
+            "macro": "{$PDM.GUEST.STOP.ALERT}",
+            "value": "1",
+            "description": "Set to 0 to silence \"Stopped\". Context: <remote>/<vmid>, e.g. {$PDM.GUEST.STOP.ALERT:\"cluster1/105\"}."
+          },
+          {
+            "macro": "{$PDM.GUEST.DISK.WARN}",
+            "value": "90",
+            "description": "Container root disk warning percent, sustained 5m. Context: <remote>/<vmid>."
+          },
+          {
+            "macro": "{$PDM.STORAGE.PUSED.WARN}",
+            "value": "80",
+            "description": "PVE storage warning percent, sustained 5m. Context: <remote>/<storage> (shared) or <remote>/<node>/<storage> (local)."
+          },
+          {
+            "macro": "{$PDM.STORAGE.PUSED.CRIT}",
+            "value": "90",
+            "description": "PVE storage critical percent, sustained 5m. Same context as the warning macro."
+          },
+          {
+            "macro": "{$PDM.PBS.CPU.WARN}",
+            "value": "90",
+            "description": "PBS CPU warning percent, sustained 5m. Context: <remote>/<node>."
+          },
+          {
+            "macro": "{$PDM.PBS.MEMORY.WARN}",
+            "value": "90",
+            "description": "PBS memory warning percent, sustained 5m. Context: <remote>/<node>."
+          },
+          {
+            "macro": "{$PDM.DATASTORE.PUSED.WARN}",
+            "value": "80",
+            "description": "PBS datastore warning percent, sustained 5m. Context: <remote>/<datastore>."
+          },
+          {
+            "macro": "{$PDM.DATASTORE.PUSED.CRIT}",
+            "value": "90",
+            "description": "PBS datastore critical percent, sustained 5m. Context: <remote>/<datastore>."
+          }
+        ],
+        "valuemaps": [
+          {
+            "uuid": "604865484b545bbdbd07db9db6616f37",
+            "name": "PDM datastore maintenance",
+            "mappings": [
+              {
+                "value": "0",
+                "newvalue": "No"
+              },
+              {
+                "value": "1",
+                "newvalue": "Yes"
+              }
+            ]
+          },
+          {
+            "uuid": "efecceac79715e278f13caef32dc24a7",
+            "name": "PDM guest state",
+            "mappings": [
+              {
+                "value": "0",
+                "newvalue": "Stopped"
+              },
+              {
+                "value": "1",
+                "newvalue": "Running"
+              },
+              {
+                "value": "2",
+                "newvalue": "Unknown"
+              }
+            ]
+          },
+          {
+            "uuid": "40f6c9bd7b485ccba3f0e9ad0e769058",
+            "name": "PDM node state",
+            "mappings": [
+              {
+                "value": "0",
+                "newvalue": "Offline"
+              },
+              {
+                "value": "1",
+                "newvalue": "Online"
+              },
+              {
+                "value": "2",
+                "newvalue": "Unknown"
+              }
+            ]
+          },
+          {
+            "uuid": "3602a9d9475a50da9a4b835d8b293b94",
+            "name": "PDM remote reachable",
+            "mappings": [
+              {
+                "value": "0",
+                "newvalue": "Unreachable"
+              },
+              {
+                "value": "1",
+                "newvalue": "OK"
+              }
+            ]
+          },
+          {
+            "uuid": "0befe9a82e6d5d3ea0fe9676132ab1f3",
+            "name": "PDM storage state",
+            "mappings": [
+              {
+                "value": "1",
+                "newvalue": "Available"
+              },
+              {
+                "value": "2",
+                "newvalue": "Unknown"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "graphs": [
+      {
+        "uuid": "ca2c0090f78b5a929c6d7a53e121bdd4",
+        "name": "PDM: Guests",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.qemu.running"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.qemu.stopped"
+            }
+          },
+          {
+            "sortorder": "2",
+            "color": "2774A4",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.lxc.running"
+            }
+          },
+          {
+            "sortorder": "3",
+            "color": "FC6EA3",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.lxc.stopped"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "a6e558e472935b72a7f08536364ba390",
+        "name": "PDM: PVE CPU utilization",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.pve.cpu.util"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "2f868a5c006d56dcb99011188d61f2e5",
+        "name": "PDM: PVE memory",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.pve.memory.total"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.pve.memory.used"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "df1134796c3958e5a2ecdec569236420",
+        "name": "PDM: PVE storage",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.pve.storage.total"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.pve.storage.used"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "6d705d500153560793df46fcbf6ab157",
+        "name": "PDM: PBS storage",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.pbs.storage.total"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.pbs.storage.used"
+            }
+          }
+        ]
+      },
+      {
+        "uuid": "649637449ff25fe1832534d8f76c44a2",
+        "name": "PDM: Remotes",
+        "graph_items": [
+          {
+            "sortorder": "0",
+            "color": "199C0D",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.remotes"
+            }
+          },
+          {
+            "sortorder": "1",
+            "color": "F63100",
+            "item": {
+              "host": "Proxmox Datacenter Manager remotes by HTTP",
+              "key": "pdm.res.remotes.failed"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
